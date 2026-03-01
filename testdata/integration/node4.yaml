@@ -1,0 +1,26 @@
+# Integration test: 3 racks x 2 nodes (rack2)
+cluster_name: carp-test
+node_id: node4
+host: 127.0.0.1
+rack: rack2
+port: 26382
+gossip_port: 27003
+rpc_port: 27382
+replication_factor: 3
+vnodes: 64
+seed_nodes:
+  - host: 127.0.0.1
+    gossip_port: 27000
+  - host: 127.0.0.1
+    gossip_port: 27001
+  - host: 127.0.0.1
+    gossip_port: 27002
+  - host: 127.0.0.1
+    gossip_port: 27003
+  - host: 127.0.0.1
+    gossip_port: 27004
+  - host: 127.0.0.1
+    gossip_port: 27005
+dir: ./testdata/integration/data/node4
+dbfilename: dump.rdb
+save_interval: 0

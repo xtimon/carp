@@ -1,0 +1,17 @@
+# Unified CARP config - all values from environment variables
+# Single-node: use defaults. Cluster: set NODE_ID, HOST, SEEDS, etc.
+cluster_name: ${CLUSTER_NAME:-carp}
+node_id: ${NODE_ID:-node1}
+host: ${HOST:-127.0.0.1}
+rack: ${RACK:-}
+bind_address: ${BIND_ADDRESS:-}
+port: ${PORT:-6379}
+gossip_port: ${GOSSIP_PORT:-7000}
+rpc_port: ${RPC_PORT:-7379}
+replication_factor: ${REPLICATION_FACTOR:-3}
+vnodes: ${VNODES:-64}
+seed_nodes: []
+dir: ${DIR:-/data}
+dbfilename: ${DBFILENAME:-dump.rdb}
+save_interval: ${SAVE_INTERVAL:-60}
+tombstone_grace_seconds: ${TOMBSTONE_GRACE_SECONDS:-60}

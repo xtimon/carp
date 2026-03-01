@@ -1,0 +1,16 @@
+# Single-node configuration (development / Docker)
+# Uses env vars: ${VAR} or ${VAR:-default}
+cluster_name: ${CLUSTER_NAME:-carp}
+node_id: ${NODE_ID:-node1}
+host: ${HOST:-127.0.0.1}
+rack: ${RACK:-}
+port: ${PORT:-6379}
+gossip_port: ${GOSSIP_PORT:-7000}
+rpc_port: ${RPC_PORT:-7379}
+replication_factor: ${REPLICATION_FACTOR:-1}
+vnodes: ${VNODES:-64}
+seed_nodes: []   # Empty = standalone, no cluster discovery
+dir: ${DIR:-./data}
+dbfilename: ${DBFILENAME:-dump.rdb}
+save_interval: ${SAVE_INTERVAL:-0}   # 0 = disabled
+tombstone_grace_seconds: ${TOMBSTONE_GRACE_SECONDS:-60}
