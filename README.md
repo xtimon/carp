@@ -2,6 +2,8 @@
 
 [![CI](https://github.com/xtimon/carp/actions/workflows/ci.yml/badge.svg)](https://github.com/xtimon/carp/actions/workflows/ci.yml)
 
+![Cassandra + Redis](docs/assets/cassandra-redis-meme.jpg)
+
 **Cassandra Architecture for Redis Protocol** — A Redis-compatible key-value store built with Apache Cassandra-style architecture in Go.
 
 ## Documentation
