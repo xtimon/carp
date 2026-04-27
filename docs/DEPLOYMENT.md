@@ -171,3 +171,43 @@ Replicas are spread across racks when `rack` is set.
 ### Graceful Shutdown
 
 Use `CLUSTER LEAVE <nodename>` (connect to the node and run it, specifying that node's name) to gracefully leave the cluster before stopping the process. The node will save state and shut down.
+
+### Production: Authentication
+
+By default, both the client port and the inter-node ports accept anyone who can reach them. For any deployment exposed beyond a single trusted host, enable both surfaces:
+
+1. **Cluster secret** — every node gets the same `CARP_CLUSTER_SECRET`, so a stranger on the network can't speak RPC or join gossip.
+2. **Client AUTH** — clients must `AUTH` before issuing data commands.
+
+#### Generate a bcrypt hash for the password
+
+```bash
+htpasswd -bnBC 12 "" "your-password" | tr -d ':\n'
+```
+
+#### Single-password (Redis `requirepass` shortcut)
+
+```bash
+docker run -d --name carp \
+  -p 6379:6379 -p 7000:7000 -p 7379:7379 \
+  -e HOST=0.0.0.0 \
+  -e CARP_CLUSTER_SECRET="$(openssl rand -hex 32)" \
+  -e CARP_REQUIREPASS='$2a$12$...' \
+  carp
+```
+
+Clients connect with `AUTH <password>` (or `redis-cli -a <password>`).
+
+#### Docker Compose with cluster secret + multi-user
+
+Add `cluster_secret` and an `auth.users` block to each node's config (or pass the secret via env). Example for the 3-node compose stack above:
+
+```yaml
+environment:
+  CARP_CLUSTER_SECRET: ${CARP_CLUSTER_SECRET}   # shared by all 3 nodes
+  # ...existing env vars
+```
+
+Mount or bake in a YAML config with the user list. All nodes need the **same** user list — ACL is enforced at whichever node coordinates the request.
+
+For the full security model (roles, key scoping, error codes, limitations), see [SECURITY.md](SECURITY.md).

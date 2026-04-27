@@ -14,12 +14,37 @@ CONSISTENCY ALL     # All replicas must ack (strongest)
 
 ---
 
+## Authentication
+
+When the server has `requirepass` or `auth.users` configured, clients must authenticate before issuing data commands. Full reference: [SECURITY.md](SECURITY.md).
+
+| Command | Description | Example |
+|---------|-------------|---------|
+| `AUTH password` | Authenticate as the `default` user | `AUTH s3cr3t` |
+| `AUTH user password` | Authenticate as a named user | `AUTH app1 s3cr3t` |
+| `HELLO 2 AUTH user password` | Protocol handshake combined with AUTH | `HELLO 2 AUTH app1 s3cr3t` |
+
+`PING`, `INFO`, and read-only `CLUSTER` subcommands (`INFO`, `NODES`, `RING`, `KEYSLOT`, `TOKEN`, `KEYNODE`) work pre-auth so health probes and ring-aware client bootstrap aren't blocked.
+
+### Error codes
+
+| Code | Meaning |
+|------|---------|
+| `NOAUTH Authentication required.` | A data command was sent before AUTH succeeded |
+| `WRONGPASS invalid username-password pair or user is disabled` | Bad credentials |
+| `NOPERM this user has no permissions to run the '<cmd>' command` | User's role doesn't allow this command category |
+| `NOPERM this user has no permissions to access one of the keys used as arguments` | Key falls outside the user's `keys` patterns |
+
+After 5 failed AUTH attempts on a single connection, the server logs and drops the connection. Reconnect to retry.
+
+---
+
 ## Connection & Server
 
 | Command | Description | Example |
 |---------|-------------|---------|
-| `PING` | Health check | `PING` |
-| `HELLO` | Protocol handshake | `HELLO 2` |
+| `PING` | Health check (allowed pre-auth) | `PING` |
+| `HELLO` | Protocol handshake; supports inline AUTH | `HELLO 2 AUTH user pw` |
 | `QUIT` | Close connection | `QUIT` |
 | `ECHO message` | Echo message | `ECHO hello` |
 | `TIME` | Server time | `TIME` |

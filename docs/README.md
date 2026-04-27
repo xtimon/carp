@@ -9,6 +9,7 @@ Documentation for **CARP** (Cassandra Architecture for Redis Protocol), a Redis-
 | [ARCHITECTURE.md](ARCHITECTURE.md) | System design, components, data flow, failure modes |
 | [CONFIGURATION.md](CONFIGURATION.md) | Configuration options, environment variables, examples |
 | [COMMANDS.md](COMMANDS.md) | Redis command reference (supported commands) |
+| [SECURITY.md](SECURITY.md) | Inter-node HMAC, client AUTH, ACL roles, key scoping |
 | [DEVELOPMENT.md](DEVELOPMENT.md) | Build, test, project structure, contributing |
 | [DEPLOYMENT.md](DEPLOYMENT.md) | Docker, production deployment, best practices |
 

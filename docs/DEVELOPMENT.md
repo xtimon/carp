@@ -73,20 +73,24 @@ make test-cover
 go test -cover ./...
 ```
 
-### Integration Tests (6-Node Cluster)
+### Integration Tests
 
 ```bash
 make test-integration
 # or
-go test -tags=integration ./integration -v -timeout 90s
+go test -tags=integration ./integration -v -timeout 240s
 ```
 
-The integration test:
+Each test builds its own binary, picks a distinct port range, and tears down on exit. Shared boilerplate lives in `integration/helpers_test.go`.
 
-- Builds the server binary
-- Starts 6 nodes (3 racks × 2 nodes) from `testdata/integration/node1.yaml`–`node6.yaml`
-- Verifies cluster formation, rack metadata, SET/GET, and more
-- Cleans up on exit
+| Test | Nodes | Secret | Auth | What it covers |
+|------|-------|--------|------|----------------|
+| `TestIntegration_3Racks2NodesPerRack` | 6 | — | — | Cluster formation, racks, SET/GET, rebalance — backward-compat path |
+| `TestIntegration_ClusterSecret_RejectsUnauthenticated` | 1 | ✓ | — | Rogue RPC and gossip dropped without the secret |
+| `TestIntegration_ClientAuth_RequirePass` | 1 | — | ✓ | NOAUTH gating, PING pre-auth, AUTH happy/sad paths |
+| `TestIntegration_ACL_RolesAndKeyScoping` | 1 | — | ✓ | Roles (admin/readwrite/readonly), key prefix scoping, KEYS filtering |
+| `TestIntegration_AuthRateLimit` | 1 | — | ✓ | Connection dropped after 5 wrong AUTHs |
+| `TestIntegration_MultiNodeAuthAndSecret` | 3 | ✓ | ✓ | Production shape: convergence + cross-node RPC over HMAC + ACL across the ring |
 
 ### Benchmarks
 
@@ -112,7 +116,9 @@ carp/
 │   ├── rebalance/  # Key migration on topology change
 │   ├── cluster/    # Gossip membership
 │   ├── rpc/        # Node-to-node protocol
-│   └── coordinator/# Request routing, consistency
+│   ├── coordinator/# Request routing, consistency, ACL gate
+│   ├── auth/       # Client AUTH, roles, ACL evaluation
+│   └── clusterauth/# HMAC framing for inter-node RPC + gossip
 ├── config/         # YAML configs
 ├── testdata/       # Test fixtures
 ├── integration/    # Integration tests

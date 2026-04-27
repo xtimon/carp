@@ -135,6 +135,37 @@ Per-node key-value engine:
 | Gossip      | 7000    | Cluster membership protocol      |
 | RPC         | 7379    | Internal node-to-node storage ops|
 
+## Security Model
+
+Three independent surfaces, each opt-in. All disabled by default for backward compatibility.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ Client → Coordinator                                                        │
+│   AUTH / HELLO at RESP layer → per-conn Session                             │
+│   ACL enforcement (role + key prefix) at Execute() entry                    │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ Coordinator → Replica nodes                                                 │
+│   HMAC-SHA256 frame wrapper (cluster_secret) on every RPC frame             │
+│   Internal RPC implicitly trusted post-HMAC; ACL not re-evaluated           │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ Gossip                                                                      │
+│   Same HMAC wrapper as RPC; rogue peers can't inject ring state             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+- **`internal/clusterauth`** wraps inter-node TCP frames with HMAC-SHA256 when a cluster secret is configured.
+- **`internal/auth`** holds the user registry, bcrypt verification, role/category logic, and key-pattern matching.
+- ACL is enforced **once** at the coordinator (the node that owns the client connection). Internal RPC trusts whatever the coordinator dispatched — there's no per-frame user identity.
+
+Full reference: [SECURITY.md](SECURITY.md).
+
 ## Failure Modes and Recovery
 
 - **Node crash**: Gossip marks it DOWN; replicas serve reads/writes; `CLUSTER REPAIR` restores under-replicated keys

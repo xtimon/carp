@@ -58,6 +58,9 @@ cluster_name: ${CLUSTER_NAME:-carp}
 | `dbfilename` | string | `dump.rdb` | RDB filename inside `dir`. |
 | `save_interval` | int | 0 | Auto-save interval in seconds. `0` = disabled. |
 | `tombstone_grace_seconds` | int | 60 | Grace period before purging tombstones. `0` = no GC. |
+| `cluster_secret` | string | (empty) | HMAC secret for inter-node RPC and gossip. When set, every node in the cluster must use the same value. Empty = legacy unauthenticated framing. See [SECURITY.md](SECURITY.md#inter-node-authentication-cluster-secret). |
+| `requirepass` | string | (empty) | Bcrypt hash for the `default` user. Single-password client AUTH; ignored if `auth.users` is configured. See [SECURITY.md](SECURITY.md#single-password-mode-redis-requirepass-shortcut). |
+| `auth.users` | list | `[]` | Multi-user table. Each entry: `name`, `password_hash` (bcrypt), `role` (`admin`/`readwrite`/`readonly`/`none`), optional `keys` (prefix-pattern list). See [SECURITY.md](SECURITY.md#multi-user-mode). |
 
 ## Environment Variables
 
@@ -79,6 +82,8 @@ These override config file values when set:
 | `DBFILENAME` | RDB filename |
 | `SAVE_INTERVAL` | Auto-save interval (seconds) |
 | `TOMBSTONE_GRACE_SECONDS` | Tombstone grace period |
+| `CARP_CLUSTER_SECRET` | HMAC secret for inter-node RPC + gossip |
+| `CARP_REQUIREPASS` | Bcrypt hash for the `default` user (single-password mode) |
 
 ## Example Configurations
 
@@ -141,6 +146,37 @@ port: 6381
 gossip_port: 7002
 # ... etc.
 ```
+
+## Authentication & Access Control
+
+Auth is opt-in. Without any of `cluster_secret`, `requirepass`, or `auth.users`, the server behaves exactly as before (no auth, no HMAC) — see [SECURITY.md](SECURITY.md) for the full reference.
+
+### Cluster + single password (minimal production)
+
+```yaml
+cluster_secret: ${CARP_CLUSTER_SECRET}
+requirepass: "$2a$12$..."         # bcrypt hash of the password
+```
+
+### Cluster + multi-user with key scoping
+
+```yaml
+cluster_secret: ${CARP_CLUSTER_SECRET}
+auth:
+  users:
+    - name: ops
+      password_hash: "$2a$12$..."
+      role: admin
+    - name: app1
+      password_hash: "$2a$12$..."
+      role: readwrite
+      keys: ["app1:*"]
+    - name: monitor
+      password_hash: "$2a$12$..."
+      role: readonly
+```
+
+When `auth.users` is non-empty, every node in the cluster should be configured with the same user list — ACL is enforced at whichever node coordinates the request.
 
 ## Docker
 

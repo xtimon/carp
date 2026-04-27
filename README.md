@@ -13,6 +13,7 @@
 | [Architecture](docs/ARCHITECTURE.md) | System design, components, data flow |
 | [Configuration](docs/CONFIGURATION.md) | Config options and environment variables |
 | [Commands Reference](docs/COMMANDS.md) | Supported Redis commands |
+| [Security](docs/SECURITY.md) | Inter-node HMAC, client AUTH, ACL roles, key scoping |
 | [Development](docs/DEVELOPMENT.md) | Build, test, project structure |
 | [Deployment](docs/DEPLOYMENT.md) | Docker, production tips |
 | [Contributing](CONTRIBUTING.md) | How to contribute |
@@ -25,6 +26,7 @@
 - **Replication** across nodes with configurable replication factor
 - **Coordinator pattern**: any node can receive client requests and coordinate writes/reads
 - **Full RESP2 protocol**: works with `redis-cli` and any Redis client
+- **Authentication & ACL** (opt-in): inter-node HMAC, Redis-style `AUTH`, role-based access (`admin`/`readwrite`/`readonly`) with optional per-user key-prefix scoping
 
 ## Architecture (Cassandra-style)
 
@@ -133,6 +135,20 @@ redis-cli -p 6379 CLUSTER REPAIR SMOOTH
 redis-cli -p 6379 CLUSTER REPAIR SMOOTH 200   # 200ms delay between vnodes
 ```
 
+## Authentication (optional)
+
+Auth is opt-in; without configuration the server behaves as before. The smallest useful setup turns on both surfaces:
+
+```bash
+# Shared by every node — closes the inter-node perimeter
+export CARP_CLUSTER_SECRET="$(openssl rand -hex 32)"
+
+# bcrypt hash of the client password — gates RESP commands
+export CARP_REQUIREPASS='$2a$12$...'
+```
+
+Then clients send `AUTH <password>` (or `redis-cli -a <password>`). For multi-user setups with role-based access and key-prefix scoping, see [docs/SECURITY.md](docs/SECURITY.md).
+
 ## Ring-Aware Client & CLI
 
 The project includes a **ring-aware client** (`carp-cli`) that routes requests directly to the node owning the key (Cassandra-style), with automatic failover when nodes are down:
@@ -219,7 +235,9 @@ internal/
   rebalance/        # Migrates orphaned keys when nodes join/leave
   cluster/          # Gossip membership
   rpc/              # Node-to-node protocol
-  coordinator/      # Request routing
+  coordinator/      # Request routing, ACL gate
+  auth/             # Client AUTH, roles, ACL evaluation
+  clusterauth/      # HMAC framing for inter-node RPC + gossip
 config/
   single-node.yaml
   node1.yaml, node2.yaml, node3.yaml
@@ -239,6 +257,8 @@ config/
 | `VNODES` | 64 | Virtual nodes per physical node (better key distribution) |
 | `CLUSTER_NAME` | carp | Cluster name (shown in CLUSTER INFO). Nodes with different cluster names will not join the same ring. |
 | `SEEDS` | - | Override seeds: `host:gossip_port host:gossip_port`. Gossip also uses discovered peers as targets, so a node with no seeds can still join if it receives an inbound gossip connection. |
+| `CARP_CLUSTER_SECRET` | - | HMAC secret for inter-node RPC + gossip. All nodes must share the same value. Empty = legacy unauthenticated. |
+| `CARP_REQUIREPASS` | - | Bcrypt hash for the `default` user (single-password client AUTH). |
 
 ## License
 
