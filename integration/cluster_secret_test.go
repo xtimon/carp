@@ -28,6 +28,7 @@ func TestIntegration_ClusterSecret_RejectsUnauthenticated(t *testing.T) {
 	dataDir := freshDataDir(t, "secret-node")
 	respAddr := fmt.Sprintf("127.0.0.1:%d", respPort)
 
+	const password = "secret-test-pw"
 	startServer(t, binPath, []string{
 		"NODE_ID=secret-node",
 		fmt.Sprintf("PORT=%d", respPort),
@@ -38,13 +39,15 @@ func TestIntegration_ClusterSecret_RejectsUnauthenticated(t *testing.T) {
 		"CLUSTER_NAME=carp-secret-test",
 		"DIR=" + dataDir,
 		"CARP_CLUSTER_SECRET=" + secret,
+		"CARP_REQUIREPASS=" + bcryptHash(t, password),
 	}, respAddr)
 	// Give RPC + gossip ports a moment too (RESP coming up is the readiness signal).
 	time.Sleep(300 * time.Millisecond)
 
-	// 1. Sanity: client RESP path still works (no client auth in this test).
+	// 1. Sanity: authenticated client RESP path still works.
 	c := client.New([]string{respAddr})
 	c.SetReplicationFactor(1)
+	c.SetCredentials("default", password)
 	if _, err := c.Do("SET", []byte("k"), []byte("v")); err != nil {
 		t.Fatalf("RESP SET should succeed: %v", err)
 	}

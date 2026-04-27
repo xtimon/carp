@@ -35,6 +35,7 @@ func TestIntegration_ClientAuth_RequirePass(t *testing.T) {
 		"VNODES=8",
 		"CLUSTER_NAME=carp-auth-test",
 		"DIR=" + dataDir,
+		"CARP_CLUSTER_SECRET=auth-test-secret",
 		"CARP_REQUIREPASS=" + hash,
 	}, respAddr)
 

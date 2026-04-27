@@ -19,3 +19,9 @@ seed_nodes:
 dir: ${DIR:-./data}
 dbfilename: ${DBFILENAME:-dump-node1.rdb}
 save_interval: ${SAVE_INTERVAL:-60}  # 0 = disabled
+
+# Required: shared HMAC secret + at least one user with a password.
+# All nodes in this cluster must share the same cluster_secret. See
+# docs/SECURITY.md for multi-user / role / key-prefix examples.
+cluster_secret: ${CARP_CLUSTER_SECRET}
+requirepass: ${CARP_REQUIREPASS}

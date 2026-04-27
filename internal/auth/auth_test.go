@@ -15,37 +15,30 @@ func mustHash(t *testing.T, pw string) string {
 	return string(h)
 }
 
-func TestRegistry_OpenMode_NoPasswordsConfigured(t *testing.T) {
-	r := NewRegistry(nil)
-	if r.AuthRequired() {
-		t.Fatal("registry with no users should be open")
-	}
-	s := NewSession(r)
-	if !s.Authenticated() {
-		t.Fatal("session in open mode should be pre-authenticated")
-	}
-	if s.User().Name != "default" {
-		t.Errorf("expected default user, got %q", s.User().Name)
-	}
-}
-
-func TestRegistry_LockedOnce_AnyUserHasPassword(t *testing.T) {
+func TestRegistry_DefaultUserIsLocked(t *testing.T) {
+	// default user is always present but locked unless explicitly granted.
 	r := NewRegistry([]User{
 		{Name: "app1", PasswordHash: mustHash(t, "secret")},
 	})
-	if !r.AuthRequired() {
-		t.Fatal("registry with a password should require auth")
-	}
-	s := NewSession(r)
-	if s.Authenticated() {
-		t.Fatal("locked registry should yield unauthenticated session")
-	}
 	def := r.Lookup("default")
 	if def == nil {
 		t.Fatal("default user should always exist")
 	}
+	if def.Role != RoleNone {
+		t.Errorf("default role = %d, want RoleNone", def.Role)
+	}
 	if def.NoPass {
-		t.Error("default user must not be NoPass when registry is locked")
+		t.Error("default user must not be NoPass — that would let anyone in")
+	}
+}
+
+func TestNewSession_StartsUnauthenticated(t *testing.T) {
+	s := NewSession()
+	if s.Authenticated() {
+		t.Error("new session should start unauthenticated")
+	}
+	if s.User() != nil {
+		t.Error("new session should have no user")
 	}
 }
 
@@ -81,7 +74,7 @@ func TestSession_FailedAuthCounter(t *testing.T) {
 	r := NewRegistry([]User{
 		{Name: "app1", PasswordHash: mustHash(t, "p")},
 	})
-	s := NewSession(r)
+	s := NewSession()
 	if s.FailedAuth() != 0 {
 		t.Errorf("new session FailedAuth = %d, want 0", s.FailedAuth())
 	}
@@ -105,7 +98,7 @@ func TestSession_SetUser(t *testing.T) {
 	r := NewRegistry([]User{
 		{Name: "app1", PasswordHash: mustHash(t, "p")},
 	})
-	s := NewSession(r)
+	s := NewSession()
 	if s.Authenticated() {
 		t.Fatal("locked session should start unauthenticated")
 	}

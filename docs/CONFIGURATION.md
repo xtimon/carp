@@ -58,9 +58,11 @@ cluster_name: ${CLUSTER_NAME:-carp}
 | `dbfilename` | string | `dump.rdb` | RDB filename inside `dir`. |
 | `save_interval` | int | 0 | Auto-save interval in seconds. `0` = disabled. |
 | `tombstone_grace_seconds` | int | 60 | Grace period before purging tombstones. `0` = no GC. |
-| `cluster_secret` | string | (empty) | HMAC secret for inter-node RPC and gossip. When set, every node in the cluster must use the same value. Empty = legacy unauthenticated framing. See [SECURITY.md](SECURITY.md#inter-node-authentication-cluster-secret). |
-| `requirepass` | string | (empty) | Bcrypt hash for the `default` user. Single-password client AUTH; ignored if `auth.users` is configured. See [SECURITY.md](SECURITY.md#single-password-mode-redis-requirepass-shortcut). |
-| `auth.users` | list | `[]` | Multi-user table. Each entry: `name`, `password_hash` (bcrypt), `role` (`admin`/`readwrite`/`readonly`/`none`), optional `keys` (prefix-pattern list). See [SECURITY.md](SECURITY.md#multi-user-mode). |
+| `cluster_secret` | string | **required** | HMAC secret for inter-node RPC and gossip. Every node in the cluster must share the same value. Server refuses to start if missing. See [SECURITY.md](SECURITY.md#inter-node-authentication-cluster-secret). |
+| `requirepass` | string | **required¹** | Bcrypt hash for the `default` user. Single-password shortcut; ignored if `auth.users` is configured. See [SECURITY.md](SECURITY.md#single-password-mode-redis-requirepass-shortcut). |
+| `auth.users` | list | **required¹** | Multi-user table. Each entry: `name`, `password_hash` (bcrypt), `role` (`admin`/`readwrite`/`readonly`/`none`), optional `keys` (prefix-pattern list). See [SECURITY.md](SECURITY.md#multi-user-mode). |
+
+¹ Either `requirepass` or at least one `auth.users` entry with a password must be configured. Server fails fast with a clear error message otherwise.
 
 ## Environment Variables
 
@@ -101,7 +103,11 @@ vnodes: 64
 seed_nodes: []   # No seeds = standalone
 dir: ./data
 dbfilename: dump.rdb
+cluster_secret: ${CARP_CLUSTER_SECRET}
+requirepass: ${CARP_REQUIREPASS}
 ```
+
+Run with both env vars set (`openssl rand -hex 32` for the secret, `htpasswd -bnBC 12 "" pw | tr -d ':\n'` for the bcrypt hash).
 
 ### 3-Node Cluster (node1)
 
@@ -121,6 +127,8 @@ seed_nodes:
     gossip_port: 7001
   - host: 127.0.0.1
     gossip_port: 7002
+cluster_secret: ${CARP_CLUSTER_SECRET}   # same value on every node
+requirepass: ${CARP_REQUIREPASS}         # or use auth.users for multi-user
 ```
 
 ### 6-Node Cluster with Racks (3 racks × 2 nodes)
@@ -149,7 +157,7 @@ gossip_port: 7002
 
 ## Authentication & Access Control
 
-Auth is opt-in. Without any of `cluster_secret`, `requirepass`, or `auth.users`, the server behaves exactly as before (no auth, no HMAC) — see [SECURITY.md](SECURITY.md) for the full reference.
+Auth is required — the server refuses to start without `cluster_secret` and at least one user with a password. See [SECURITY.md](SECURITY.md) for the full reference.
 
 ### Cluster + single password (minimal production)
 

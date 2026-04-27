@@ -137,7 +137,7 @@ Per-node key-value engine:
 
 ## Security Model
 
-Three independent surfaces, each opt-in. All disabled by default for backward compatibility.
+Three independent surfaces; the first two are required for the server to start.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐

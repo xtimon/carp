@@ -26,7 +26,7 @@
 - **Replication** across nodes with configurable replication factor
 - **Coordinator pattern**: any node can receive client requests and coordinate writes/reads
 - **Full RESP2 protocol**: works with `redis-cli` and any Redis client
-- **Authentication & ACL** (opt-in): inter-node HMAC, Redis-style `AUTH`, role-based access (`admin`/`readwrite`/`readonly`) with optional per-user key-prefix scoping
+- **Authentication required by default**: inter-node HMAC, Redis-style `AUTH`, role-based access (`admin`/`readwrite`/`readonly`) with optional per-user key-prefix scoping
 
 ## Architecture (Cassandra-style)
 
@@ -79,17 +79,26 @@
 go build -o carp ./cmd/server
 ```
 
+### Set required credentials
+
+Auth is mandatory — the server refuses to start without these two env vars:
+
+```bash
+export CARP_CLUSTER_SECRET="$(openssl rand -hex 32)"   # shared by every node
+export CARP_REQUIREPASS="$(htpasswd -bnBC 12 '' your-password | tr -d ':\n')"
+```
+
 ### Single node
 
 ```bash
 ./carp --config config/single-node.yaml
 ```
 
-Then connect: `redis-cli -p 6379`
+Then connect with the password: `redis-cli -p 6379 -a your-password`.
 
 ### Three-node cluster
 
-Start each node in a separate terminal:
+Start each node in a separate terminal (each must see the same `CARP_CLUSTER_SECRET` and `CARP_REQUIREPASS`):
 
 ```bash
 # Terminal 1
@@ -102,7 +111,7 @@ Start each node in a separate terminal:
 ./carp --config config/node3.yaml
 ```
 
-You should see `Discovered ...` in the logs when nodes find each other. Connect with `redis-cli -p 6379` (or 6380, 6381). For **automatic failover** when a node dies (e.g. run `CLUSTER LEAVE FORCE node3` from a live node to remove it), use `carp-cli` instead—it will try other nodes when the connected one is down.
+You should see `Discovered ...` in the logs when nodes find each other. Connect with `redis-cli -p 6379 -a your-password` (or 6380, 6381). For **automatic failover** when a node dies (e.g. run `CLUSTER LEAVE FORCE node3` from a live node to remove it), use `carp-cli` instead — it will try other nodes when the connected one is down.
 
 ### Leaving the cluster
 
@@ -135,19 +144,9 @@ redis-cli -p 6379 CLUSTER REPAIR SMOOTH
 redis-cli -p 6379 CLUSTER REPAIR SMOOTH 200   # 200ms delay between vnodes
 ```
 
-## Authentication (optional)
+## Authentication
 
-Auth is opt-in; without configuration the server behaves as before. The smallest useful setup turns on both surfaces:
-
-```bash
-# Shared by every node — closes the inter-node perimeter
-export CARP_CLUSTER_SECRET="$(openssl rand -hex 32)"
-
-# bcrypt hash of the client password — gates RESP commands
-export CARP_REQUIREPASS='$2a$12$...'
-```
-
-Then clients send `AUTH <password>` (or `redis-cli -a <password>`). For multi-user setups with role-based access and key-prefix scoping, see [docs/SECURITY.md](docs/SECURITY.md).
+Auth is required from day one (see [Quick Start](#set-required-credentials)). Clients send `AUTH <password>` (or `redis-cli -a <password>`). For multi-user setups with role-based access and key-prefix scoping, see [docs/SECURITY.md](docs/SECURITY.md).
 
 ## Ring-Aware Client & CLI
 
@@ -257,8 +256,8 @@ config/
 | `VNODES` | 64 | Virtual nodes per physical node (better key distribution) |
 | `CLUSTER_NAME` | carp | Cluster name (shown in CLUSTER INFO). Nodes with different cluster names will not join the same ring. |
 | `SEEDS` | - | Override seeds: `host:gossip_port host:gossip_port`. Gossip also uses discovered peers as targets, so a node with no seeds can still join if it receives an inbound gossip connection. |
-| `CARP_CLUSTER_SECRET` | - | HMAC secret for inter-node RPC + gossip. All nodes must share the same value. Empty = legacy unauthenticated. |
-| `CARP_REQUIREPASS` | - | Bcrypt hash for the `default` user (single-password client AUTH). |
+| `CARP_CLUSTER_SECRET` | **required** | HMAC secret for inter-node RPC + gossip. All nodes must share the same value. |
+| `CARP_REQUIREPASS` | **required¹** | Bcrypt hash for the `default` user (single-password client AUTH). Either this or `auth.users` in YAML must be configured. |
 
 ## License
 

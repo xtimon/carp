@@ -14,3 +14,8 @@ dir: ${DIR:-./data}
 dbfilename: ${DBFILENAME:-dump.rdb}
 save_interval: ${SAVE_INTERVAL:-0}   # 0 = disabled
 tombstone_grace_seconds: ${TOMBSTONE_GRACE_SECONDS:-60}
+
+# Required: HMAC secret shared by every node and a bcrypt-hashed client
+# password. Server refuses to start if either is missing — see docs/SECURITY.md.
+cluster_secret: ${CARP_CLUSTER_SECRET}
+requirepass: ${CARP_REQUIREPASS}

@@ -42,6 +42,7 @@ func TestIntegration_ACL_RolesAndKeyScoping(t *testing.T) {
 		"replication_factor": 1,
 		"vnodes":             8,
 		"cluster_name":       "carp-acl-test",
+		"cluster_secret":     "acl-test-secret",
 		"dir":                dataDir,
 		"auth": map[string]interface{}{
 			"users": []map[string]interface{}{

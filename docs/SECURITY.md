@@ -1,6 +1,8 @@
 # Security
 
-CARP has three independent security surfaces. Each can be enabled on its own; existing deployments without any of them keep working unchanged.
+Auth is required. CARP refuses to start without `cluster_secret` and at least one user with a password configured. There is no "no-auth" deployment shape.
+
+CARP has three independent security surfaces:
 
 | Surface | What it protects | Mechanism |
 |---|---|---|
@@ -14,9 +16,9 @@ CARP has three independent security surfaces. Each can be enabled on its own; ex
 
 ## Inter-node authentication (cluster secret)
 
-Every RPC and gossip frame is authenticated with HMAC-SHA256 when `cluster_secret` is set. A peer without the secret (or with the wrong one) gets its connection silently dropped.
+Every RPC and gossip frame is authenticated with HMAC-SHA256. A peer without the secret (or with the wrong one) gets its connection silently dropped.
 
-### Enable
+### Configure
 
 ```yaml
 # carp.yaml on every node
@@ -25,7 +27,7 @@ cluster_secret: ${CARP_CLUSTER_SECRET}
 
 …or via environment variable: `CARP_CLUSTER_SECRET=...`
 
-All nodes in the cluster must share the same secret. Mixed mode (some nodes with, some without) does not work — the framing is incompatible.
+All nodes in the cluster must share the same secret. Generate one with `openssl rand -hex 32` and distribute it via your secrets manager.
 
 ### What it does
 
@@ -107,15 +109,16 @@ OK
 
 When using the bundled Go client (`carp-cli` / `carp-bench`), call `client.SetCredentials(user, pw)` — credentials are pipelined automatically on every connection.
 
-### Default user policy (Redis-compatible)
+### Default user policy
+
+The `default` user is always present, mirroring Redis convention:
 
 | Configuration | `default` user behavior |
 |---|---|
-| No `requirepass`, no `auth.users` | Unauthenticated, full access (current "no auth" deployment) |
 | `requirepass` only | Has the configured password, role `admin` |
 | `auth.users` defined | Locked (`role: none`) unless explicitly granted |
 
-This means turning on auth is opt-in. Existing clusters keep working until you add credentials.
+There is no third row — running without either is rejected at startup.
 
 ### Pre-auth allowed commands
 

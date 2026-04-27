@@ -82,36 +82,21 @@ func (u *User) FilterKeys(keys [][]byte) [][]byte {
 type Registry struct {
 	mu    sync.RWMutex
 	users map[string]*User
-	// authRequired is true when at least one user has a password configured.
-	// When false, every connection is implicitly authenticated as `default`
-	// — preserves the current "no auth" deployment shape.
-	authRequired bool
 }
 
-// NewRegistry builds a registry from the configured users. If no user has a
-// password, the registry is in "open" mode: AuthRequired() returns false and
-// new sessions start fully authenticated as the synthetic `default` user.
+// NewRegistry builds a registry from the configured users. The `default`
+// user is always present; if the caller didn't supply one, it is created
+// with no password and no role (locked) so unauthenticated callers can't
+// fall through to it. Caller is responsible for ensuring at least one user
+// has a password — that's a server-startup concern, not a registry concern.
 func NewRegistry(users []User) *Registry {
 	r := &Registry{users: make(map[string]*User)}
-	hasPassword := false
 	for i := range users {
 		u := users[i]
-		if u.PasswordHash != "" {
-			hasPassword = true
-		}
 		r.users[u.Name] = &u
 	}
-	r.authRequired = hasPassword
 	if _, ok := r.users["default"]; !ok {
-		// Always have a `default` user. When no passwords are configured it's
-		// the implicit principal for every connection (full admin access — same
-		// as today's no-auth deployment). Once any user gets a password,
-		// `default` becomes locked (Role=None) unless explicitly granted.
-		def := &User{Name: "default", NoPass: !hasPassword}
-		if !hasPassword {
-			def.Role = RoleAdmin
-		}
-		r.users["default"] = def
+		r.users["default"] = &User{Name: "default", Role: RoleNone}
 	}
 	return r
 }
@@ -122,13 +107,6 @@ func NewRegistry(users []User) *Registry {
 // can submit — Role=Admin here is fine because it never sees a write.
 func GuestUser() *User {
 	return &User{Name: "guest", NoPass: true, Role: RoleAdmin}
-}
-
-// AuthRequired reports whether clients must AUTH before issuing commands.
-func (r *Registry) AuthRequired() bool {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return r.authRequired
 }
 
 // Lookup returns the named user or nil.
@@ -161,19 +139,9 @@ type Session struct {
 	failedAuth  int
 }
 
-// NewSession returns a session that is pre-authenticated as `default` when
-// the registry has no passwords configured, and unauthenticated otherwise.
-func NewSession(r *Registry) *Session {
-	if r == nil || !r.AuthRequired() {
-		// Open mode: implicit default user, every command goes through.
-		def := &User{Name: "default", NoPass: true}
-		if r != nil {
-			if existing := r.Lookup("default"); existing != nil {
-				def = existing
-			}
-		}
-		return &Session{user: def}
-	}
+// NewSession returns a fresh, unauthenticated session. AUTH must succeed
+// before the dispatcher will run any data command on this session.
+func NewSession() *Session {
 	return &Session{}
 }
 

@@ -36,6 +36,7 @@ func TestIntegration_AuthRateLimit(t *testing.T) {
 		"VNODES=8",
 		"CLUSTER_NAME=carp-rl-test",
 		"DIR=" + dataDir,
+		"CARP_CLUSTER_SECRET=rl-test-secret",
 		"CARP_REQUIREPASS=" + bcryptHash(t, password),
 	}, respAddr)
 

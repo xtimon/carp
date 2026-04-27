@@ -24,3 +24,6 @@ seed_nodes:
 dir: ./testdata/integration/data/node3
 dbfilename: dump.rdb
 save_interval: 0
+
+cluster_secret: ${CARP_CLUSTER_SECRET}
+requirepass: ${CARP_REQUIREPASS}

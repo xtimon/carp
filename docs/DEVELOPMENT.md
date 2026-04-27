@@ -85,12 +85,12 @@ Each test builds its own binary, picks a distinct port range, and tears down on 
 
 | Test | Nodes | Secret | Auth | What it covers |
 |------|-------|--------|------|----------------|
-| `TestIntegration_3Racks2NodesPerRack` | 6 | — | — | Cluster formation, racks, SET/GET, rebalance — backward-compat path |
-| `TestIntegration_ClusterSecret_RejectsUnauthenticated` | 1 | ✓ | — | Rogue RPC and gossip dropped without the secret |
-| `TestIntegration_ClientAuth_RequirePass` | 1 | — | ✓ | NOAUTH gating, PING pre-auth, AUTH happy/sad paths |
-| `TestIntegration_ACL_RolesAndKeyScoping` | 1 | — | ✓ | Roles (admin/readwrite/readonly), key prefix scoping, KEYS filtering |
-| `TestIntegration_AuthRateLimit` | 1 | — | ✓ | Connection dropped after 5 wrong AUTHs |
-| `TestIntegration_MultiNodeAuthAndSecret` | 3 | ✓ | ✓ | Production shape: convergence + cross-node RPC over HMAC + ACL across the ring |
+| `TestIntegration_3Racks2NodesPerRack` | 6 | ✓ | ✓ | Cluster formation, racks, SET/GET, rebalance — full Redis surface under auth |
+| `TestIntegration_ClusterSecret_RejectsUnauthenticated` | 1 | ✓ | ✓ | Rogue RPC and gossip dropped without the secret |
+| `TestIntegration_ClientAuth_RequirePass` | 1 | ✓ | ✓ | NOAUTH gating, PING pre-auth, AUTH happy/sad paths |
+| `TestIntegration_ACL_RolesAndKeyScoping` | 1 | ✓ | ✓ | Roles (admin/readwrite/readonly), key prefix scoping, KEYS filtering |
+| `TestIntegration_AuthRateLimit` | 1 | ✓ | ✓ | Connection dropped after 5 wrong AUTHs |
+| `TestIntegration_MultiNodeAuthAndSecret` | 3 | ✓ | ✓ | Multi-tenant shape: convergence + cross-node RPC over HMAC + ACL across the ring |
 
 ### Benchmarks
 

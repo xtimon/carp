@@ -24,6 +24,11 @@ const (
 	startupDelay  = 500 * time.Millisecond
 	convergeWait  = 30 * time.Second
 	convergePoll  = 500 * time.Millisecond
+
+	// Auth is required from day one — these test creds are baked into every
+	// node via env vars and used by the client to issue data commands.
+	testClusterSecret = "integration-cluster-secret"
+	testPassword      = "integration-password"
 )
 
 // TestIntegration_3Racks2NodesPerRack starts a 6-node cluster (3 racks x 2 nodes)
@@ -70,12 +75,18 @@ func TestIntegration_3Racks2NodesPerRack(t *testing.T) {
 
 	// Start 6 nodes
 	cmds := make([]*exec.Cmd, numNodes)
+	passwordHash := bcryptHash(t, testPassword)
+	subprocessEnv := append(os.Environ(),
+		"CARP_CLUSTER_SECRET="+testClusterSecret,
+		"CARP_REQUIREPASS="+passwordHash,
+	)
 	for i := 0; i < numNodes; i++ {
 		cfg := filepath.Join(configDir, fmt.Sprintf("node%d.yaml", i+1))
 		cmds[i] = exec.Command(binary, "--config", cfg)
 		cmds[i].Dir = projectRoot
 		cmds[i].Stdout = os.Stdout
 		cmds[i].Stderr = os.Stderr
+		cmds[i].Env = subprocessEnv
 		if err := cmds[i].Start(); err != nil {
 			stopAll(cmds[:i+1])
 			t.Fatalf("start node%d: %v", i+1, err)
@@ -102,6 +113,7 @@ func TestIntegration_3Racks2NodesPerRack(t *testing.T) {
 		}
 		c = client.New(strings.Split(seeds, ","))
 		c.SetReplicationFactor(3)
+		c.SetCredentials("default", testPassword)
 		info, err := c.Do("CLUSTER", []byte("INFO"))
 		if err != nil {
 			time.Sleep(convergePoll)
@@ -130,6 +142,7 @@ func TestIntegration_3Racks2NodesPerRack(t *testing.T) {
 		for _, addr := range seedAddrs {
 			c2 := client.New([]string{addr})
 			c2.SetReplicationFactor(3)
+			c2.SetCredentials("default", testPassword)
 			nodesRaw, err := c2.Do("CLUSTER", []byte("NODES"))
 			if err != nil {
 				continue

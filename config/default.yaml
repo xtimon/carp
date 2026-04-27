@@ -15,3 +15,8 @@ dir: ${DIR:-/data}
 dbfilename: ${DBFILENAME:-dump.rdb}
 save_interval: ${SAVE_INTERVAL:-60}
 tombstone_grace_seconds: ${TOMBSTONE_GRACE_SECONDS:-60}
+
+# Required: HMAC secret + at least one user with a password. Server refuses
+# to start if either is missing — see docs/SECURITY.md.
+cluster_secret: ${CARP_CLUSTER_SECRET}
+requirepass: ${CARP_REQUIREPASS}

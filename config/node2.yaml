@@ -19,3 +19,7 @@ seed_nodes:
 dir: ${DIR:-./data}
 dbfilename: ${DBFILENAME:-dump-node2.rdb}
 save_interval: ${SAVE_INTERVAL:-60}  # 0 = disabled
+
+# Required (shared with the rest of the cluster). See docs/SECURITY.md.
+cluster_secret: ${CARP_CLUSTER_SECRET}
+requirepass: ${CARP_REQUIREPASS}

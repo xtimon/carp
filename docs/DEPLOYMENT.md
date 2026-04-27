@@ -35,10 +35,14 @@ docker build -t carp .
 
 ### Run Single Node
 
+The two `CARP_*` env vars are required — the server fails fast otherwise:
+
 ```bash
 docker run -d --name carp \
   -p 6379:6379 -p 7000:7000 -p 7379:7379 \
   -e HOST=0.0.0.0 \
+  -e CARP_CLUSTER_SECRET="$(openssl rand -hex 32)" \
+  -e CARP_REQUIREPASS='$2a$12$...' \
   carp
 ```
 
@@ -48,6 +52,8 @@ docker run -d --name carp \
 docker run -d --name carp \
   -p 6379:6379 -p 7000:7000 -p 7379:7379 \
   -e HOST=0.0.0.0 \
+  -e CARP_CLUSTER_SECRET="$(openssl rand -hex 32)" \
+  -e CARP_REQUIREPASS='$2a$12$...' \
   -v carp-data:/app/data \
   -e DIR=/app/data \
   -e SAVE_INTERVAL=60 \
@@ -60,6 +66,11 @@ Create `docker-compose.yaml`:
 
 ```yaml
 version: "3.8"
+
+x-auth-env: &auth-env
+  CARP_CLUSTER_SECRET: ${CARP_CLUSTER_SECRET}    # set in your shell before `docker compose up`
+  CARP_REQUIREPASS: ${CARP_REQUIREPASS}          # bcrypt hash of the client password
+
 services:
   carp1:
     build: .
@@ -68,6 +79,7 @@ services:
       - "7000:7000"
       - "7379:7379"
     environment:
+      <<: *auth-env
       NODE_ID: node1
       HOST: carp1
       PORT: 6379
@@ -85,6 +97,7 @@ services:
       - "7001:7000"
       - "7380:7379"
     environment:
+      <<: *auth-env
       NODE_ID: node2
       HOST: carp2
       PORT: 6379
@@ -102,6 +115,7 @@ services:
       - "7002:7000"
       - "7381:7379"
     environment:
+      <<: *auth-env
       NODE_ID: node3
       HOST: carp3
       PORT: 6379
@@ -172,9 +186,9 @@ Replicas are spread across racks when `rack` is set.
 
 Use `CLUSTER LEAVE <nodename>` (connect to the node and run it, specifying that node's name) to gracefully leave the cluster before stopping the process. The node will save state and shut down.
 
-### Production: Authentication
+### Authentication (required)
 
-By default, both the client port and the inter-node ports accept anyone who can reach them. For any deployment exposed beyond a single trusted host, enable both surfaces:
+The server refuses to start without `cluster_secret` and at least one user with a password. All sample configs reference these via env-var expansion (`${CARP_CLUSTER_SECRET}`, `${CARP_REQUIREPASS}`); the operator's job is to populate them at deploy time:
 
 1. **Cluster secret** — every node gets the same `CARP_CLUSTER_SECRET`, so a stranger on the network can't speak RPC or join gossip.
 2. **Client AUTH** — clients must `AUTH` before issuing data commands.

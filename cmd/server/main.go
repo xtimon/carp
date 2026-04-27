@@ -212,15 +212,17 @@ func main() {
 		log.Fatal(err)
 	}
 
-	if cfg.ClusterSecret != "" {
-		rpc.SetClusterSecret([]byte(cfg.ClusterSecret))
-		log.Printf("[server] Inter-node HMAC enabled (RPC + gossip)")
+	if cfg.ClusterSecret == "" {
+		log.Fatal("[server] cluster_secret is required (set CARP_CLUSTER_SECRET env or cluster_secret in YAML)")
 	}
+	rpc.SetClusterSecret([]byte(cfg.ClusterSecret))
+	log.Printf("[server] Inter-node HMAC enabled (RPC + gossip)")
 
-	authRegistry := buildAuthRegistry(cfg)
-	if authRegistry.AuthRequired() {
-		log.Printf("[server] Client AUTH required")
+	authRegistry, err := buildAuthRegistry(cfg)
+	if err != nil {
+		log.Fatalf("[server] %v", err)
 	}
+	log.Printf("[server] Client AUTH required")
 
 	store := storage.New()
 	if cfg.TombstoneGraceSeconds > 0 {
@@ -235,9 +237,7 @@ func main() {
 		log.Printf("[server] Loaded RDB from %s", rdbPath)
 	}
 	gossip := cluster.NewGossip(cfg.NodeID, cfg.Host, cfg.Port, cfg.GossipPort, cfg.ClusterName, cfg.Rack)
-	if cfg.ClusterSecret != "" {
-		gossip.SetClusterSecret([]byte(cfg.ClusterSecret))
-	}
+	gossip.SetClusterSecret([]byte(cfg.ClusterSecret))
 	part := partitioner.NewPartitioner(cfg.ReplicationFactor)
 	if cfg.NumVnodes > 0 {
 		part.SetNumVnodes(cfg.NumVnodes)
@@ -383,19 +383,21 @@ func main() {
 
 // buildAuthRegistry resolves config (requirepass + auth.users) into a Registry.
 // Precedence: explicit auth.users wins; otherwise requirepass becomes the
-// default user's password; otherwise the registry is in open mode.
-//
-// Role parsing: any unrecognized role causes Fatal — fail-fast on misconfig
-// rather than silently demoting a user to no access.
-func buildAuthRegistry(cfg *nodeConfig) *auth.Registry {
+// default user's password. At least one user with a password must be
+// configured — open/no-auth mode is no longer supported.
+func buildAuthRegistry(cfg *nodeConfig) (*auth.Registry, error) {
 	var users []auth.User
+	hasPassword := false
 	for _, u := range cfg.Auth.Users {
 		if u.Name == "" {
 			continue
 		}
 		role, ok := auth.ParseRole(u.Role)
 		if !ok {
-			log.Fatalf("[server] invalid role %q for user %q", u.Role, u.Name)
+			return nil, fmt.Errorf("invalid role %q for user %q", u.Role, u.Name)
+		}
+		if u.PasswordHash != "" {
+			hasPassword = true
 		}
 		users = append(users, auth.User{
 			Name:         u.Name,
@@ -405,14 +407,18 @@ func buildAuthRegistry(cfg *nodeConfig) *auth.Registry {
 		})
 	}
 	if len(users) == 0 && cfg.RequirePass != "" {
-		// Single-password mode: treat as full-access default user.
+		// Single-password shortcut: default user gets full access.
 		users = append(users, auth.User{
 			Name:         "default",
 			PasswordHash: cfg.RequirePass,
 			Role:         auth.RoleAdmin,
 		})
+		hasPassword = true
 	}
-	return auth.NewRegistry(users)
+	if !hasPassword {
+		return nil, fmt.Errorf("auth required: configure auth.users (with at least one password_hash) or set requirepass / CARP_REQUIREPASS")
+	}
+	return auth.NewRegistry(users), nil
 }
 
 func handleRESP(conn net.Conn, coord *coordinator.Coordinator, reg *auth.Registry) {
@@ -420,7 +426,7 @@ func handleRESP(conn net.Conn, coord *coordinator.Coordinator, reg *auth.Registr
 	reader := resp.Reader{}
 	buf := make([]byte, 65536)
 	var connConsistency *coordinator.ConsistencyLevel
-	session := auth.NewSession(reg)
+	session := auth.NewSession()
 	for {
 		n, err := conn.Read(buf)
 		if err != nil || n == 0 {
@@ -554,7 +560,7 @@ func handleHello(session *auth.Session, reg *auth.Registry, args [][]byte, peer 
 			i += 2
 		}
 	}
-	if reg.AuthRequired() && !session.Authenticated() {
+	if !session.Authenticated() {
 		return resp.EncodeError("NOAUTH Authentication required.")
 	}
 	// Minimal handshake response (a few key fields redis-cli expects).
