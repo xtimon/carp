@@ -1447,22 +1447,24 @@ func (c *Coordinator) execHashCmd(cmd string, key []byte, replicas []replica, ar
 		return nil
 	}
 	hashReadCmds := map[string]bool{"HGET": true, "HMGET": true, "HGETALL": true, "HEXISTS": true, "HLEN": true, "HKEYS": true, "HVALS": true}
-	for _, r := range replicas {
-		var b []byte
+	firstResult, acks := c.dispatchPrimaryFirst(replicas, required, func(r replica) ([]byte, bool) {
 		if r.nodeID == c.NodeID {
-			b = c.execHashLocal(cmd, key, args)
-			// Hash read commands can return nil/empty; return local result immediately
-			if hashReadCmds[cmd] {
-				return c.encodeHashResponse(cmd, b)
-			}
-		} else {
-			b, _ = rpc.SendCommand(r.host, r.port, rpcCmd, args)
+			b := c.execHashLocal(cmd, key, args)
+			return b, b != nil
 		}
-		if b != nil {
-			return c.encodeHashResponse(cmd, b)
+		b, ok := c.rpcWithRetry(r, rpcCmd, args)
+		return b, ok && b != nil
+	})
+	if hashReadCmds[cmd] {
+		if acks == 0 {
+			return c.encodeHashResponse(cmd, nil)
 		}
+		return c.encodeHashResponse(cmd, firstResult)
 	}
-	return nil
+	if acks < required {
+		return resp.EncodeError("replication failed")
+	}
+	return c.encodeHashResponse(cmd, firstResult)
 }
 
 func (c *Coordinator) encodeHashResponse(cmd string, b []byte) []byte {
