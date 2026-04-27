@@ -23,7 +23,7 @@ const (
 func (s *Storage) DumpKey(key []byte) ([]byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	k := s.key(key)
+	k := string(key)
 
 	// Expire any stale keys first
 	s.maybeExpire(key)
@@ -190,7 +190,7 @@ func (s *Storage) RestoreKey(key, data []byte) error {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	k := s.key(key)
+	k := string(key)
 
 	switch typ {
 	case migrateTypeString:

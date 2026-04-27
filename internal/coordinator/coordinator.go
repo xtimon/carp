@@ -151,6 +151,108 @@ func (c *Coordinator) rpcWithRetry(r replica, cmd byte, args [][]byte) ([]byte, 
 	return b, err == nil
 }
 
+// parallelDispatch fans fn out to every replica concurrently and returns the
+// first successful body together with the total ack count, returning early
+// once `required` acks have been collected. All goroutines run to completion
+// (they write to a buffered channel that's GC'd after this function exits),
+// so every replica still receives the operation — we just don't wait on
+// the slow ones before responding to the client.
+//
+// The "first body" returned is whichever replica responded fastest, NOT the
+// primary. That's safe for ack-only commands (SET, DEL, EXPIRE) where every
+// replica's response is identical. For commands that return state-derived
+// values (GET, LPOP, INCR, length-returning pushes, etc.) use
+// dispatchPrimaryFirst — a stale replica responding first would leak its
+// stale view to the client.
+func (c *Coordinator) parallelDispatch(replicas []replica, required int, fn func(replica) ([]byte, bool)) (firstBody []byte, acks int) {
+	if len(replicas) == 0 {
+		return nil, 0
+	}
+	if required > len(replicas) {
+		required = len(replicas)
+	}
+	if required < 1 {
+		required = 1
+	}
+	type result struct {
+		body []byte
+		ok   bool
+	}
+	out := make(chan result, len(replicas))
+	for _, r := range replicas {
+		r := r
+		go func() {
+			body, ok := fn(r)
+			out <- result{body, ok}
+		}()
+	}
+	for i := 0; i < len(replicas); i++ {
+		r := <-out
+		if !r.ok {
+			continue
+		}
+		if firstBody == nil {
+			firstBody = r.body
+		}
+		acks++
+		if acks >= required {
+			return
+		}
+	}
+	return
+}
+
+// dispatchPrimaryFirst applies fn to the primary replica synchronously, then
+// fans out to the rest in parallel for the remaining acks. The body returned
+// is the primary's body when primary acks (which is the authoritative value
+// for state-derived results like GET/LPOP/INCR), or the first parallel body
+// from the others when primary fails.
+//
+// All replicas still receive the operation — the parallel fan-out spawns
+// goroutines for every member of `rest` even when primary alone meets quorum.
+func (c *Coordinator) dispatchPrimaryFirst(replicas []replica, required int, fn func(replica) ([]byte, bool)) (firstBody []byte, acks int) {
+	if len(replicas) == 0 {
+		return nil, 0
+	}
+	if required > len(replicas) {
+		required = len(replicas)
+	}
+	if required < 1 {
+		required = 1
+	}
+
+	primary := replicas[0]
+	rest := replicas[1:]
+
+	body, ok := fn(primary)
+	if ok {
+		firstBody = body
+		acks = 1
+	}
+
+	if len(rest) == 0 {
+		return
+	}
+
+	// Apply on the rest regardless — they need the operation even if primary
+	// alone met quorum. When primary already covers `required`, fire-and-forget
+	// so the client isn't held up; otherwise wait for enough additional acks.
+	moreNeeded := required - acks
+	if moreNeeded <= 0 {
+		for _, r := range rest {
+			r := r
+			go fn(r)
+		}
+		return
+	}
+	restBody, restAcks := c.parallelDispatch(rest, moreNeeded, fn)
+	acks += restAcks
+	if firstBody == nil {
+		firstBody = restBody
+	}
+	return
+}
+
 // Execute handles a Redis command and returns RESP response.
 //
 // Flow: key-less commands (PING, etc) → single-key commands → extended (sets, hashes, zsets).
@@ -249,63 +351,28 @@ func (c *Coordinator) Execute(cmdName []byte, args [][]byte, consistencyOverride
 		switch cmd {
 		case "GET":
 			required := c.requiredReplicasFor(consistencyOverride)
-			// Prefer primary (first replica) for consistency: primary is authoritative for recent writes,
-			// so returning primaryVal avoids returning stale data when quorum is met from slower replicas.
-			var primaryVal []byte
-			responses := 0
-			for _, r := range replicas {
-				var val []byte
-				var ok bool
+			firstVal, responses := c.dispatchPrimaryFirst(replicas, required, func(r replica) ([]byte, bool) {
 				if r.nodeID == c.NodeID {
-					val, _ = c.Storage.Get(key)
-					ok = true
-				} else {
-					val, ok = c.rpcWithRetry(r, rpc.CmdGet, [][]byte{key})
+					v, _ := c.Storage.Get(key)
+					return v, true
 				}
-				if !ok {
-					continue
-				}
-				responses++
-				if primaryVal == nil {
-					primaryVal = val
-				}
-				if responses >= required {
-					break
-				}
-			}
+				return c.rpcWithRetry(r, rpc.CmdGet, [][]byte{key})
+			})
 			if responses >= required {
-				return resp.EncodeBulkString(primaryVal)
+				return resp.EncodeBulkString(firstVal)
 			}
 			return resp.EncodeError("CLUSTERDOWN Not enough replicas for QUORUM")
 		case "EXISTS":
 			required := c.requiredReplicasFor(consistencyOverride)
-			responses, found := 0, false
-			for _, r := range replicas {
-				var n int
-				var ok bool
+			firstBody, responses := c.dispatchPrimaryFirst(replicas, required, func(r replica) ([]byte, bool) {
 				if r.nodeID == c.NodeID {
-					n, _ = c.Storage.Exists(key)
-					ok = true
-				} else {
-					var b []byte
-					b, ok = c.rpcWithRetry(r, rpc.CmdExists, [][]byte{key})
-					if ok && len(b) > 0 {
-						n = int(b[0])
-					}
+					n, _ := c.Storage.Exists(key)
+					return []byte{byte(n)}, true
 				}
-				if !ok {
-					continue
-				}
-				responses++
-				if n == 1 {
-					found = true
-				}
-				if responses >= required {
-					break
-				}
-			}
+				return c.rpcWithRetry(r, rpc.CmdExists, [][]byte{key})
+			})
 			if responses >= required {
-				if found {
+				if len(firstBody) > 0 && firstBody[0] == 1 {
 					return resp.EncodeInteger(1)
 				}
 				return resp.EncodeInteger(0)
@@ -313,32 +380,16 @@ func (c *Coordinator) Execute(cmdName []byte, args [][]byte, consistencyOverride
 			return resp.EncodeError("CLUSTERDOWN Not enough replicas for QUORUM")
 		case "TTL":
 			required := c.requiredReplicasFor(consistencyOverride)
-			var primaryTTL *int
-			responses := 0
-			for _, r := range replicas {
-				var ok bool
-				var t int
+			firstBody, responses := c.dispatchPrimaryFirst(replicas, required, func(r replica) ([]byte, bool) {
 				if r.nodeID == c.NodeID {
-					t, _ = c.Storage.TTL(key)
-					ok = true
-				} else {
-					var b []byte
-					b, ok = c.rpcWithRetry(r, rpc.CmdTTL, [][]byte{key})
-					if ok && len(b) > 0 {
-						t, _ = strconv.Atoi(string(b))
-					}
+					t, _ := c.Storage.TTL(key)
+					return []byte(strconv.Itoa(t)), true
 				}
-				if !ok {
-					continue
-				}
-				responses++
-				if primaryTTL == nil {
-					tval := t
-					primaryTTL = &tval
-				}
-				if responses >= required {
-					return resp.EncodeInteger(*primaryTTL)
-				}
+				return c.rpcWithRetry(r, rpc.CmdTTL, [][]byte{key})
+			})
+			if responses >= required {
+				t, _ := strconv.Atoi(string(firstBody))
+				return resp.EncodeInteger(t)
 			}
 			return resp.EncodeError("CLUSTERDOWN Not enough replicas for QUORUM")
 		case "INCR":
@@ -394,21 +445,22 @@ func (c *Coordinator) Execute(cmdName []byte, args [][]byte, consistencyOverride
 			return resp.EncodeError("replicas unavailable")
 		case "PERSIST":
 			required := c.requiredReplicasFor(consistencyOverride)
-			acks := 0
-			for _, r := range replicas {
-				var ok bool
+			_, acks := c.dispatchPrimaryFirst(replicas, required, func(r replica) ([]byte, bool) {
 				if r.nodeID == c.NodeID {
-					ok, _ = c.Storage.Persist(key)
-				} else {
-					b, _ := rpc.SendCommand(r.host, r.port, rpc.CmdPersist, [][]byte{key})
-					ok = bytes.Equal(b, []byte("1"))
+					ok, _ := c.Storage.Persist(key)
+					if ok {
+						return []byte("1"), true
+					}
+					return nil, false
 				}
-				if ok {
-					acks++
+				b, _ := rpc.SendCommand(r.host, r.port, rpc.CmdPersist, [][]byte{key})
+				if bytes.Equal(b, []byte("1")) {
+					return b, true
 				}
-				if acks >= required {
-					return resp.EncodeInteger(1)
-				}
+				return nil, false
+			})
+			if acks >= required {
+				return resp.EncodeInteger(1)
 			}
 			return resp.EncodeInteger(0)
 		}
@@ -429,26 +481,25 @@ func (c *Coordinator) Execute(cmdName []byte, args [][]byte, consistencyOverride
 		if len(replicas) == 0 {
 			return resp.EncodeError("CLUSTERDOWN The cluster is down")
 		}
-		acks := 0
-		for _, r := range replicas {
+		required := c.requiredReplicasFor(consistencyOverride)
+		_, acks := c.parallelDispatch(replicas, required, func(r replica) ([]byte, bool) {
 			if r.nodeID == c.NodeID {
 				c.Storage.Set(key, value, ttl)
-				acks++
-			} else {
-				res, ok := c.rpcWithRetry(r, rpc.CmdSet, [][]byte{key, value})
-				if ok && bytes.Equal(res, []byte("OK")) {
-					acks++
-				}
+				return []byte("OK"), true
 			}
-		}
-		required := c.requiredReplicasFor(consistencyOverride)
+			res, ok := c.rpcWithRetry(r, rpc.CmdSet, [][]byte{key, value})
+			return res, ok && bytes.Equal(res, []byte("OK"))
+		})
 		if acks >= required {
 			return resp.EncodeSimpleString("OK")
 		}
 		return resp.EncodeError("replication failed")
 	}
 
-	// DEL: replicate tombstone to all replicas for consistent deletion
+	// DEL: replicate tombstone to all replicas for consistent deletion. We
+	// fan out per-key so each replica gets its tombstone; we wait for all
+	// to compute "had" (OR across replicas) since any one having the key
+	// means the operation deleted something.
 	if cmd == "DEL" {
 		if len(args) < 1 {
 			return resp.EncodeError("wrong number of arguments for 'del' command")
@@ -460,19 +511,32 @@ func (c *Coordinator) Execute(cmdName []byte, args [][]byte, consistencyOverride
 			if len(replicas) == 0 {
 				continue
 			}
+			type res struct {
+				ok  bool
+				had bool
+			}
+			out := make(chan res, len(replicas))
+			for _, r := range replicas {
+				r := r
+				go func() {
+					if r.nodeID == c.NodeID {
+						had, _ := c.Storage.SetTombstone(key)
+						out <- res{true, had}
+						return
+					}
+					b, err := rpc.SendCommand(r.host, r.port, rpc.CmdSetTombstone, [][]byte{key})
+					out <- res{err == nil && b != nil, bytes.Equal(b, []byte("1"))}
+				}()
+			}
 			acks := 0
 			had := false
-			for _, r := range replicas {
-				if r.nodeID == c.NodeID {
-					hadKey, _ := c.Storage.SetTombstone(key)
+			for i := 0; i < len(replicas); i++ {
+				r := <-out
+				if r.ok {
 					acks++
-					had = had || hadKey
-				} else {
-					res, err := rpc.SendCommand(r.host, r.port, rpc.CmdSetTombstone, [][]byte{key})
-					if err == nil && res != nil {
-						acks++
-						had = had || bytes.Equal(res, []byte("1"))
-					}
+				}
+				if r.had {
+					had = true
 				}
 			}
 			if acks >= required && had {
@@ -494,25 +558,21 @@ func (c *Coordinator) Execute(cmdName []byte, args [][]byte, consistencyOverride
 			return resp.EncodeError("CLUSTERDOWN The cluster is down")
 		}
 		required := c.requiredReplicasFor(consistencyOverride)
-		acks := 0
-		keyExisted := false
-		for _, r := range replicas {
-			var ok bool
+		_, acks := c.dispatchPrimaryFirst(replicas, required, func(r replica) ([]byte, bool) {
 			if r.nodeID == c.NodeID {
-				ok, _ = c.Storage.Expire(key, secs)
-			} else {
-				res, _ := rpc.SendCommand(r.host, r.port, rpc.CmdExpire, [][]byte{key, args[1]})
-				ok = bytes.Equal(res, []byte("1"))
+				ok, _ := c.Storage.Expire(key, secs)
+				if ok {
+					return []byte("1"), true
+				}
+				return nil, false
 			}
-			if ok {
-				acks++
-				keyExisted = true
+			res, _ := rpc.SendCommand(r.host, r.port, rpc.CmdExpire, [][]byte{key, args[1]})
+			if bytes.Equal(res, []byte("1")) {
+				return res, true
 			}
-			if acks >= required {
-				break
-			}
-		}
-		if acks >= required && keyExisted {
+			return nil, false
+		})
+		if acks >= required {
 			return resp.EncodeInteger(1)
 		}
 		return resp.EncodeInteger(0)
@@ -524,23 +584,38 @@ func (c *Coordinator) Execute(cmdName []byte, args [][]byte, consistencyOverride
 		if len(args) >= 1 {
 			pattern = args[0]
 		}
-		seen := make(map[string]bool)
-		for _, n := range c.Gossip.GetRingNodeStates() {
-			var keys [][]byte
-			if n.NodeID == c.NodeID {
-				keys, _ = c.Storage.Keys(pattern)
-			} else {
+		// Fan out to every ring node concurrently — a single node's KEYS
+		// is already O(N), no point waiting on them serially.
+		nodes := c.Gossip.GetRingNodeStates()
+		type keysResult struct{ keys [][]byte }
+		out := make(chan keysResult, len(nodes))
+		for _, n := range nodes {
+			n := n
+			go func() {
+				if n.NodeID == c.NodeID {
+					ks, _ := c.Storage.Keys(pattern)
+					out <- keysResult{ks}
+					return
+				}
 				r := replica{n.NodeID, n.Host, n.Port}
 				b, ok := c.rpcWithRetry(r, rpc.CmdKeys, [][]byte{pattern})
-				if ok && b != nil {
-					for _, k := range bytes.Split(b, []byte("\n")) {
-						if len(k) > 0 {
-							keys = append(keys, k)
-						}
+				if !ok || b == nil {
+					out <- keysResult{}
+					return
+				}
+				var ks [][]byte
+				for _, k := range bytes.Split(b, []byte("\n")) {
+					if len(k) > 0 {
+						ks = append(ks, k)
 					}
 				}
-			}
-			for _, k := range keys {
+				out <- keysResult{ks}
+			}()
+		}
+		seen := make(map[string]bool)
+		for i := 0; i < len(nodes); i++ {
+			r := <-out
+			for _, k := range r.keys {
 				seen[string(k)] = true
 			}
 		}
@@ -556,54 +631,67 @@ func (c *Coordinator) Execute(cmdName []byte, args [][]byte, consistencyOverride
 		return resp.EncodeArray(items)
 	}
 
-	// MSET
+	// MSET — run each key/value pair concurrently; each pair internally fans
+	// out to its replicas via parallelDispatch.
 	if cmd == "MSET" {
 		if len(args) < 2 || len(args)%2 != 0 {
 			return resp.EncodeError("wrong number of arguments for 'mset' command")
 		}
 		required := c.requiredReplicasFor(consistencyOverride)
+		errs := make(chan bool, len(args)/2)
 		for i := 0; i < len(args); i += 2 {
 			key, value := args[i], args[i+1]
-			replicas := c.getReplicas(key)
-			acks := 0
-			for _, r := range replicas {
-				if r.nodeID == c.NodeID {
-					c.Storage.Set(key, value, nil)
-					acks++
-				} else {
-					res, _ := rpc.SendCommand(r.host, r.port, rpc.CmdSet, [][]byte{key, value})
-					if bytes.Equal(res, []byte("OK")) {
-						acks++
+			go func() {
+				replicas := c.getReplicas(key)
+				_, acks := c.parallelDispatch(replicas, required, func(r replica) ([]byte, bool) {
+					if r.nodeID == c.NodeID {
+						c.Storage.Set(key, value, nil)
+						return []byte("OK"), true
 					}
-				}
-				if acks >= required {
-					break
-				}
+					b, _ := rpc.SendCommand(r.host, r.port, rpc.CmdSet, [][]byte{key, value})
+					return b, bytes.Equal(b, []byte("OK"))
+				})
+				errs <- (acks < required)
+			}()
+		}
+		anyFailed := false
+		for i := 0; i < len(args)/2; i++ {
+			if <-errs {
+				anyFailed = true
 			}
-			if acks < required {
-				return resp.EncodeError("replication failed")
-			}
+		}
+		if anyFailed {
+			return resp.EncodeError("replication failed")
 		}
 		return resp.EncodeSimpleString("OK")
 	}
 
-	// MGET
+	// MGET — fan out per key concurrently. Each key tries its replicas
+	// sequentially (any returning a value wins) but different keys run in
+	// parallel.
 	if cmd == "MGET" {
-		var results [][]byte
-		for _, key := range args {
-			var val []byte
-			for _, r := range c.getReplicas(key) {
-				if r.nodeID == c.NodeID {
-					val, _ = c.Storage.Get(key)
-				} else {
-					val, _ = rpc.SendCommand(r.host, r.port, rpc.CmdGet, [][]byte{key})
+		results := make([][]byte, len(args))
+		var wg sync.WaitGroup
+		for i, key := range args {
+			i, key := i, key
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for _, r := range c.getReplicas(key) {
+					var val []byte
+					if r.nodeID == c.NodeID {
+						val, _ = c.Storage.Get(key)
+					} else {
+						val, _ = rpc.SendCommand(r.host, r.port, rpc.CmdGet, [][]byte{key})
+					}
+					if val != nil {
+						results[i] = val
+						return
+					}
 				}
-				if val != nil {
-					break
-				}
-			}
-			results = append(results, val)
+			}()
 		}
+		wg.Wait()
 		return resp.EncodeArray(results)
 	}
 
@@ -623,73 +711,50 @@ func (c *Coordinator) Execute(cmdName []byte, args [][]byte, consistencyOverride
 			if len(args) < 2 {
 				return resp.EncodeError("wrong number of arguments for 'lpush' command")
 			}
-			acks := 0
-			var firstLen int
-			for _, r := range replicas {
+			required := c.requiredReplicasFor(consistencyOverride)
+			firstBody, acks := c.dispatchPrimaryFirst(replicas, required, func(r replica) ([]byte, bool) {
 				if r.nodeID == c.NodeID {
 					n, _ := c.Storage.LPush(key, args[1:]...)
-					acks++
-					firstLen = n
-				} else {
-					b, _ := rpc.SendCommand(r.host, r.port, rpc.CmdLPush, args)
-					if b != nil {
-						acks++
-						firstLen, _ = strconv.Atoi(string(b))
-					}
+					return []byte(strconv.Itoa(n)), true
 				}
-			}
-			required := c.requiredReplicasFor(consistencyOverride)
+				b, _ := rpc.SendCommand(r.host, r.port, rpc.CmdLPush, args)
+				return b, b != nil
+			})
 			if acks >= required {
-				return resp.EncodeInteger(firstLen)
+				n, _ := strconv.Atoi(string(firstBody))
+				return resp.EncodeInteger(n)
 			}
 			return resp.EncodeError("replication failed")
 		case "RPUSH":
 			if len(args) < 2 {
 				return resp.EncodeError("wrong number of arguments for 'rpush' command")
 			}
-			acks := 0
-			var firstLen int
-			for _, r := range replicas {
+			required := c.requiredReplicasFor(consistencyOverride)
+			firstBody, acks := c.dispatchPrimaryFirst(replicas, required, func(r replica) ([]byte, bool) {
 				if r.nodeID == c.NodeID {
 					n, _ := c.Storage.RPush(key, args[1:]...)
-					acks++
-					firstLen = n
-				} else {
-					b, _ := rpc.SendCommand(r.host, r.port, rpc.CmdRPush, args)
-					if b != nil {
-						acks++
-						firstLen, _ = strconv.Atoi(string(b))
-					}
+					return []byte(strconv.Itoa(n)), true
 				}
-			}
-			required := c.requiredReplicasFor(consistencyOverride)
+				b, _ := rpc.SendCommand(r.host, r.port, rpc.CmdRPush, args)
+				return b, b != nil
+			})
 			if acks >= required {
-				return resp.EncodeInteger(firstLen)
+				n, _ := strconv.Atoi(string(firstBody))
+				return resp.EncodeInteger(n)
 			}
 			return resp.EncodeError("replication failed")
 		case "LLEN":
 			required := c.requiredReplicasFor(consistencyOverride)
-			var n int
-			responses := 0
-			for _, r := range replicas {
-				var ok bool
+			firstBody, responses := c.dispatchPrimaryFirst(replicas, required, func(r replica) ([]byte, bool) {
 				if r.nodeID == c.NodeID {
-					n, _ = c.Storage.LLen(key)
-					ok = true
-				} else {
-					var b []byte
-					b, ok = c.rpcWithRetry(r, rpc.CmdLLen, [][]byte{key})
-					if ok && len(b) > 0 {
-						n, _ = strconv.Atoi(string(b))
-					}
+					n, _ := c.Storage.LLen(key)
+					return []byte(strconv.Itoa(n)), true
 				}
-				if !ok {
-					continue
-				}
-				responses++
-				if responses >= required {
-					return resp.EncodeInteger(n)
-				}
+				return c.rpcWithRetry(r, rpc.CmdLLen, [][]byte{key})
+			})
+			if responses >= required {
+				n, _ := strconv.Atoi(string(firstBody))
+				return resp.EncodeInteger(n)
 			}
 			return resp.EncodeError("CLUSTERDOWN Not enough replicas for QUORUM")
 		case "LRANGE":
@@ -713,54 +778,26 @@ func (c *Coordinator) Execute(cmdName []byte, args [][]byte, consistencyOverride
 			return resp.EncodeArray([][]byte{})
 		case "LPOP":
 			required := c.requiredReplicasFor(consistencyOverride)
-			acks := 0
-			var firstVal []byte
-			for _, r := range replicas {
-				var val []byte
-				ok := false
+			firstVal, acks := c.dispatchPrimaryFirst(replicas, required, func(r replica) ([]byte, bool) {
 				if r.nodeID == c.NodeID {
-					val, _ = c.Storage.LPop(key)
-					ok = true
-				} else {
-					val, ok = c.rpcWithRetry(r, rpc.CmdLPop, [][]byte{key})
+					v, _ := c.Storage.LPop(key)
+					return v, true
 				}
-				if ok {
-					acks++
-					if firstVal == nil {
-						firstVal = val
-					}
-					if acks >= required {
-						return resp.EncodeBulkString(firstVal)
-					}
-				}
-			}
+				return c.rpcWithRetry(r, rpc.CmdLPop, [][]byte{key})
+			})
 			if acks > 0 {
 				return resp.EncodeBulkString(firstVal)
 			}
 			return resp.EncodeError("replication failed")
 		case "RPOP":
 			required := c.requiredReplicasFor(consistencyOverride)
-			acks := 0
-			var firstVal []byte
-			for _, r := range replicas {
-				var val []byte
-				ok := false
+			firstVal, acks := c.dispatchPrimaryFirst(replicas, required, func(r replica) ([]byte, bool) {
 				if r.nodeID == c.NodeID {
-					val, _ = c.Storage.RPop(key)
-					ok = true
-				} else {
-					val, ok = c.rpcWithRetry(r, rpc.CmdRPop, [][]byte{key})
+					v, _ := c.Storage.RPop(key)
+					return v, true
 				}
-				if ok {
-					acks++
-					if firstVal == nil {
-						firstVal = val
-					}
-					if acks >= required {
-						return resp.EncodeBulkString(firstVal)
-					}
-				}
-			}
+				return c.rpcWithRetry(r, rpc.CmdRPop, [][]byte{key})
+			})
 			if acks > 0 {
 				return resp.EncodeBulkString(firstVal)
 			}
@@ -781,21 +818,18 @@ func (c *Coordinator) Execute(cmdName []byte, args [][]byte, consistencyOverride
 		case "LSET":
 			if len(args) >= 3 {
 				idx, _ := strconv.Atoi(string(args[1]))
-				acks := 0
-				for _, r := range replicas {
+				required := c.requiredReplicasFor(consistencyOverride)
+				_, acks := c.dispatchPrimaryFirst(replicas, required, func(r replica) ([]byte, bool) {
 					if r.nodeID == c.NodeID {
-						err := c.Storage.LSet(key, idx, args[2])
-						if err == nil {
-							acks++
+						if err := c.Storage.LSet(key, idx, args[2]); err == nil {
+							return []byte("OK"), true
 						}
-					} else {
-						b, _ := rpc.SendCommand(r.host, r.port, rpc.CmdLSet, args)
-						if bytes.Equal(b, []byte("OK")) {
-							acks++
-						}
+						return nil, false
 					}
-				}
-				if acks >= c.requiredReplicasFor(consistencyOverride) {
+					b, _ := rpc.SendCommand(r.host, r.port, rpc.CmdLSet, args)
+					return b, bytes.Equal(b, []byte("OK"))
+				})
+				if acks >= required {
 					return resp.EncodeSimpleString("OK")
 				}
 			}
@@ -803,48 +837,33 @@ func (c *Coordinator) Execute(cmdName []byte, args [][]byte, consistencyOverride
 			if len(args) >= 3 {
 				count, _ := strconv.Atoi(string(args[1]))
 				required := c.requiredReplicasFor(consistencyOverride)
-				acks := 0
-				var firstN int
-				for _, r := range replicas {
-					var n int
+				firstBody, acks := c.dispatchPrimaryFirst(replicas, required, func(r replica) ([]byte, bool) {
 					if r.nodeID == c.NodeID {
-						n, _ = c.Storage.LRem(key, count, args[2])
-						acks++
-					} else {
-						b, err := rpc.SendCommand(r.host, r.port, rpc.CmdLRem, args)
-						if err == nil && len(b) > 0 {
-							n, _ = strconv.Atoi(string(b))
-							acks++
-						}
+						n, _ := c.Storage.LRem(key, count, args[2])
+						return []byte(strconv.Itoa(n)), true
 					}
-					if acks == 1 {
-						firstN = n
-					}
-					if acks >= required {
-						return resp.EncodeInteger(firstN)
-					}
-				}
+					b, err := rpc.SendCommand(r.host, r.port, rpc.CmdLRem, args)
+					return b, err == nil && len(b) > 0
+				})
 				if acks > 0 {
-					return resp.EncodeInteger(firstN)
+					n, _ := strconv.Atoi(string(firstBody))
+					return resp.EncodeInteger(n)
 				}
 			}
 		case "LTRIM":
 			if len(args) >= 3 {
 				start, _ := strconv.Atoi(string(args[1]))
 				stop, _ := strconv.Atoi(string(args[2]))
-				acks := 0
-				for _, r := range replicas {
+				required := c.requiredReplicasFor(consistencyOverride)
+				_, acks := c.dispatchPrimaryFirst(replicas, required, func(r replica) ([]byte, bool) {
 					if r.nodeID == c.NodeID {
 						c.Storage.LTrim(key, start, stop)
-						acks++
-					} else {
-						b, _ := rpc.SendCommand(r.host, r.port, rpc.CmdLTrim, args)
-						if bytes.Equal(b, []byte("OK")) {
-							acks++
-						}
+						return []byte("OK"), true
 					}
-				}
-				if acks >= c.requiredReplicasFor(consistencyOverride) {
+					b, _ := rpc.SendCommand(r.host, r.port, rpc.CmdLTrim, args)
+					return b, bytes.Equal(b, []byte("OK"))
+				})
+				if acks >= required {
 					return resp.EncodeSimpleString("OK")
 				}
 			}
@@ -1200,37 +1219,33 @@ func (c *Coordinator) execStringCmd(cmd string, key []byte, replicas []replica, 
 		return nil
 	}
 
-	for _, r := range replicas {
-		var b []byte
+	firstResult, acks = c.dispatchPrimaryFirst(replicas, required, func(r replica) ([]byte, bool) {
 		if r.nodeID == c.NodeID {
-			b = c.execStrLocal(cmd, key, args)
-		} else {
-			b, _ = c.rpcWithRetry(r, rpcCmd, args)
+			b := c.execStrLocal(cmd, key, args)
+			return b, b != nil
 		}
-		if b != nil {
-			acks++
-			if firstResult == nil {
-				firstResult = b
-			}
-			if readCmds[cmd] {
-				switch cmd {
-				case "GETRANGE":
-					return resp.EncodeBulkString(b)
-				case "STRLEN":
-					n, _ := strconv.Atoi(string(b))
-					return resp.EncodeInteger(n)
-				}
-				return nil
-			}
-			if acks >= required {
-				switch cmd {
-				case "GETSET":
-					return resp.EncodeBulkString(firstResult)
-				case "STRLEN", "APPEND", "SETRANGE", "INCRBY", "DECRBY", "SETNX":
-					n, _ := strconv.Atoi(string(firstResult))
-					return resp.EncodeInteger(n)
-				}
-			}
+		return c.rpcWithRetry(r, rpcCmd, args)
+	})
+	if readCmds[cmd] {
+		if acks == 0 {
+			return nil
+		}
+		switch cmd {
+		case "GETRANGE":
+			return resp.EncodeBulkString(firstResult)
+		case "STRLEN":
+			n, _ := strconv.Atoi(string(firstResult))
+			return resp.EncodeInteger(n)
+		}
+		return nil
+	}
+	if acks >= required {
+		switch cmd {
+		case "GETSET":
+			return resp.EncodeBulkString(firstResult)
+		case "STRLEN", "APPEND", "SETRANGE", "INCRBY", "DECRBY", "SETNX":
+			n, _ := strconv.Atoi(string(firstResult))
+			return resp.EncodeInteger(n)
 		}
 	}
 	if writeCmds[cmd] && acks > 0 {
@@ -1316,23 +1331,16 @@ func (c *Coordinator) execSetCmd(cmd string, key []byte, replicas []replica, arg
 	default:
 		return nil
 	}
-	acks := 0
-	var firstResult []byte
-	for _, r := range replicas {
-		var b []byte
+	firstResult, acks := c.dispatchPrimaryFirst(replicas, required, func(r replica) ([]byte, bool) {
 		if r.nodeID == c.NodeID {
-			b = c.execSetLocal(cmd, key, args)
-		} else {
-			b, _ = rpc.SendCommand(r.host, r.port, rpcCmd, args)
+			b := c.execSetLocal(cmd, key, args)
+			return b, b != nil
 		}
-		if b != nil {
-			acks++
-			firstResult = b
-		}
-		if acks >= required {
-			break
-		}
-	}
+		// rpcWithRetry transparently re-dials when the pool returns a stale
+		// (server-closed) conn from a prior RPC.
+		b, ok := c.rpcWithRetry(r, rpcCmd, args)
+		return b, ok && b != nil
+	})
 	if acks < required {
 		return resp.EncodeError("replication failed")
 	}
@@ -1575,23 +1583,14 @@ func (c *Coordinator) execZSetCmd(cmd string, key []byte, replicas []replica, ar
 	default:
 		return nil
 	}
-	acks := 0
-	var firstResult []byte
-	for _, r := range replicas {
-		var b []byte
+	firstResult, acks := c.dispatchPrimaryFirst(replicas, required, func(r replica) ([]byte, bool) {
 		if r.nodeID == c.NodeID {
-			b = c.execZSetLocal(cmd, key, args)
-		} else {
-			b, _ = rpc.SendCommand(r.host, r.port, rpcCmd, args)
+			b := c.execZSetLocal(cmd, key, args)
+			return b, b != nil
 		}
-		if b != nil {
-			acks++
-			firstResult = b
-		}
-		if acks >= required {
-			break
-		}
-	}
+		b, ok := c.rpcWithRetry(r, rpcCmd, args)
+		return b, ok && b != nil
+	})
 	if acks < required {
 		return resp.EncodeError("replication failed")
 	}

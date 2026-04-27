@@ -17,7 +17,9 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"hash"
 	"io"
+	"sync"
 )
 
 const macSize = sha256.Size
@@ -25,6 +27,32 @@ const macSize = sha256.Size
 // MaxFrameSize caps body length so a hostile peer can't push us into a
 // multi-GB allocation by lying about length.
 const MaxFrameSize = 64 * 1024 * 1024
+
+// pooled HMACs avoid per-frame allocation in the steady state where every
+// call uses the same cluster secret. We can only pool a hasher tied to one
+// secret (hmac.New binds the key at construction; Reset clears running
+// state but keeps the key), so we cache the secret used by the pool and
+// fall back to a fresh hasher when callers pass a different secret (tests).
+var (
+	poolMu     sync.RWMutex
+	poolSecret []byte
+	hmacPool   sync.Pool
+)
+
+// SetPoolSecret tells the package which secret to pre-bind pooled HMAC
+// instances with. Call this once at startup, after loading config, so the
+// hot path can recycle hashers instead of allocating each frame. Calling
+// with a different value resets the pool.
+func SetPoolSecret(secret []byte) {
+	poolMu.Lock()
+	defer poolMu.Unlock()
+	poolSecret = append([]byte(nil), secret...)
+	hmacPool = sync.Pool{
+		New: func() interface{} {
+			return hmac.New(sha256.New, poolSecret)
+		},
+	}
+}
 
 // WriteFrame writes body as a single framed message. If secret is non-empty
 // the frame is HMAC-authenticated, otherwise it falls back to the legacy
@@ -80,7 +108,31 @@ func ReadFrame(r io.Reader, secret []byte) ([]byte, error) {
 }
 
 func computeMAC(secret, body []byte) []byte {
+	poolMu.RLock()
+	canPool := len(poolSecret) > 0 && bytesEqual(secret, poolSecret)
+	poolMu.RUnlock()
+	if canPool {
+		h := hmacPool.Get().(hash.Hash)
+		h.Reset()
+		h.Write(body)
+		sum := h.Sum(nil)
+		hmacPool.Put(h)
+		return sum
+	}
 	h := hmac.New(sha256.New, secret)
 	h.Write(body)
 	return h.Sum(nil)
+}
+
+// bytesEqual avoids importing "bytes" just for one Equal call.
+func bytesEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

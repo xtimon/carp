@@ -8,11 +8,17 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/carp/internal/partitioner"
 	"github.com/carp/internal/resp"
 )
+
+// poolPerAddr caps pooled connections per remote address. Tuned for typical
+// concurrent fan-out from a single client process; can be raised if you see
+// "Wait for free conn" symptoms in profiles.
+const poolPerAddr = 16
 
 // ConsistencyLevel for read/write (Cassandra-style).
 type ConsistencyLevel int
@@ -31,6 +37,15 @@ type RingEntry struct {
 	Addr   string // "host:port" (RESP port)
 }
 
+// pooledConn is a per-address cached connection with its preconfigured
+// AUTH/CONSISTENCY state already applied. The epoch tag invalidates any
+// conn that was opened before the most recent credential change.
+type pooledConn struct {
+	conn  net.Conn
+	rr    *resp.ResponseReader
+	epoch int64
+}
+
 // Client is a ring-aware Redis client that routes requests directly to the node
 // that owns the key (Cassandra-style), with reconnection on node failure.
 type Client struct {
@@ -44,11 +59,18 @@ type Client struct {
 	consistency ConsistencyLevel // session default; 0 = server default (QUORUM)
 
 	username string // optional; empty + password set => uses "default"
-	password string // optional; when non-empty, AUTH is sent on every new connection
+	password string // optional; when non-empty, AUTH is sent once per pooled connection
 
 	connectTimeout time.Duration
 	retryBackoff   time.Duration
 	maxRetries     int
+
+	// connEpoch is bumped on every credential or consistency change so that
+	// pooled connections opened with stale settings are dropped on next use.
+	connEpoch atomic.Int64
+
+	poolMu sync.Mutex
+	pools  map[string]chan *pooledConn
 }
 
 // New creates a ring-aware client. Seeds are Redis (RESP) addresses, e.g. "127.0.0.1:6379".
@@ -64,6 +86,7 @@ func New(seeds []string) *Client {
 		connectTimeout: 3 * time.Second,
 		retryBackoff:   100 * time.Millisecond,
 		maxRetries:     3,
+		pools:          make(map[string]chan *pooledConn),
 	}
 	_ = c.refreshRing()
 	return c
@@ -77,20 +100,47 @@ func (c *Client) SetReplicationFactor(rf int) {
 }
 
 // SetConsistencyLevel sets the session consistency level for subsequent commands.
-// Use ConsistencyOne, ConsistencyQuorum, ConsistencyAll, or ConsistencyLevelDefault.
+// Drains pooled connections so the new level is applied to every subsequent send.
 func (c *Client) SetConsistencyLevel(level ConsistencyLevel) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.consistency = level
+	c.mu.Unlock()
+	c.invalidatePools()
 }
 
-// SetCredentials configures AUTH credentials sent on every new connection.
-// username may be empty for the `default` user. password "" disables auth.
+// SetCredentials configures AUTH credentials applied once per pooled
+// connection. Drains pooled connections so subsequent sends re-AUTH with
+// the new credentials. username may be empty for the `default` user.
 func (c *Client) SetCredentials(username, password string) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.username = username
 	c.password = password
+	c.mu.Unlock()
+	c.invalidatePools()
+}
+
+// invalidatePools bumps the connection epoch and closes any currently-pooled
+// connections. Goroutines holding a conn at the time of invalidation will
+// drop it on release because their epoch tag no longer matches.
+func (c *Client) invalidatePools() {
+	c.connEpoch.Add(1)
+	c.poolMu.Lock()
+	pools := c.pools
+	c.poolMu.Unlock()
+	for _, pool := range pools {
+		drainPool(pool)
+	}
+}
+
+func drainPool(pool chan *pooledConn) {
+	for {
+		select {
+		case pc := <-pool:
+			pc.conn.Close()
+		default:
+			return
+		}
+	}
 }
 
 // consistencyLevelString returns the server string for the level.
@@ -147,20 +197,7 @@ func (c *Client) refreshRing() error {
 }
 
 func (c *Client) fetchRingFrom(addr string) ([]RingEntry, map[string]string, error) {
-	conn, err := net.DialTimeout("tcp", addr, c.connectTimeout)
-	if err != nil {
-		return nil, nil, err
-	}
-	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(c.connectTimeout))
-
-	cmd := resp.EncodeCommand("CLUSTER", []byte("RING"))
-	if _, err := conn.Write(cmd); err != nil {
-		return nil, nil, err
-	}
-
-	rr := resp.NewResponseReader(conn)
-	raw, err := rr.ReadResponse()
+	raw, err := c.sendToNode(addr, resp.EncodeCommand("CLUSTER", []byte("RING")))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -355,13 +392,12 @@ func (c *Client) Do(cmd string, args ...[]byte) ([]byte, error) {
 		}
 	}
 
-	// Build request; prepend CONSISTENCY when session level is set
-	req, numResponses := c.buildRequest(cmd, args)
+	req := resp.EncodeCommand(cmd, args...)
 	var lastErr error
 	// Failover order: try each addr → refresh ring on all fail → retry with exponential backoff
 	for attempt := 0; attempt < c.maxRetries; attempt++ {
 		for _, addr := range addrs {
-			raw, err := c.sendToNode(addr, req, numResponses)
+			raw, err := c.sendToNode(addr, req)
 			if err == nil {
 				return raw, nil
 			}
@@ -382,18 +418,66 @@ func (c *Client) Do(cmd string, args ...[]byte) ([]byte, error) {
 	return nil, fmt.Errorf("CLUSTERDOWN The cluster is down")
 }
 
-// buildRequest returns encoded command(s) and how many responses to expect.
-// AUTH (if credentials set) and CONSISTENCY (if non-default) are pipelined
-// before the main command — each adds one to numResponses.
-func (c *Client) buildRequest(cmd string, args [][]byte) ([]byte, int) {
+// getPool returns (creating if needed) the per-address connection pool.
+func (c *Client) getPool(addr string) chan *pooledConn {
+	c.poolMu.Lock()
+	defer c.poolMu.Unlock()
+	if p, ok := c.pools[addr]; ok {
+		return p
+	}
+	p := make(chan *pooledConn, poolPerAddr)
+	c.pools[addr] = p
+	return p
+}
+
+// acquireConn returns a ready-to-use connection from the pool or dials a new
+// one. New connections have AUTH and CONSISTENCY applied once; pooled
+// connections were already prepared on first use.
+func (c *Client) acquireConn(addr string) (*pooledConn, error) {
+	pool := c.getPool(addr)
+	epoch := c.connEpoch.Load()
+	for {
+		select {
+		case pc := <-pool:
+			if pc.epoch == epoch {
+				return pc, nil
+			}
+			pc.conn.Close() // stale, try again
+		default:
+			return c.dialAndPrepare(addr, epoch)
+		}
+	}
+}
+
+// releaseConn returns a conn to the pool. If the conn errored or its epoch
+// is stale, it's closed instead.
+func (c *Client) releaseConn(addr string, pc *pooledConn, drop bool) {
+	if drop || pc.epoch != c.connEpoch.Load() {
+		pc.conn.Close()
+		return
+	}
+	pool := c.getPool(addr)
+	select {
+	case pool <- pc:
+	default:
+		pc.conn.Close()
+	}
+}
+
+// dialAndPrepare opens a TCP connection and applies AUTH (if credentials set)
+// and CONSISTENCY (if non-default). The expensive bcrypt verify on the server
+// happens here — once per pooled connection — instead of once per request.
+func (c *Client) dialAndPrepare(addr string, epoch int64) (*pooledConn, error) {
+	conn, err := net.DialTimeout("tcp", addr, c.connectTimeout)
+	if err != nil {
+		return nil, err
+	}
+	pc := &pooledConn{conn: conn, rr: resp.NewResponseReader(conn), epoch: epoch}
+
 	c.mu.RLock()
-	cl := c.consistency
-	pw := c.password
-	user := c.username
+	user, pw, cl := c.username, c.password, c.consistency
 	c.mu.RUnlock()
 
-	var pipelined []byte
-	numResponses := 1
 	if pw != "" {
 		var authArgs [][]byte
 		if user != "" {
@@ -401,39 +485,38 @@ func (c *Client) buildRequest(cmd string, args [][]byte) ([]byte, int) {
 		} else {
 			authArgs = [][]byte{[]byte(pw)}
 		}
-		pipelined = append(pipelined, resp.EncodeCommand("AUTH", authArgs...)...)
-		numResponses++
+		if _, err := pc.exchange(resp.EncodeCommand("AUTH", authArgs...), 10*time.Second); err != nil {
+			pc.conn.Close()
+			return nil, err
+		}
 	}
 	if cl != ConsistencyLevelDefault && consistencyLevelString(cl) != "" {
-		pipelined = append(pipelined, resp.EncodeCommand("CONSISTENCY", []byte(consistencyLevelString(cl)))...)
-		numResponses++
+		if _, err := pc.exchange(resp.EncodeCommand("CONSISTENCY", []byte(consistencyLevelString(cl))), 10*time.Second); err != nil {
+			pc.conn.Close()
+			return nil, err
+		}
 	}
-	pipelined = append(pipelined, resp.EncodeCommand(cmd, args...)...)
-	return pipelined, numResponses
+	return pc, nil
 }
 
-func (c *Client) sendToNode(addr string, req []byte, numResponses int) ([]byte, error) {
-	conn, err := net.DialTimeout("tcp", addr, c.connectTimeout)
+// exchange sends one request and reads one response on a pooled conn. The
+// per-call deadline keeps a stuck server from hanging the caller indefinitely.
+func (pc *pooledConn) exchange(req []byte, timeout time.Duration) ([]byte, error) {
+	pc.conn.SetDeadline(time.Now().Add(timeout))
+	if _, err := pc.conn.Write(req); err != nil {
+		return nil, err
+	}
+	return pc.rr.ReadResponse()
+}
+
+func (c *Client) sendToNode(addr string, req []byte) ([]byte, error) {
+	pc, err := c.acquireConn(addr)
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(10 * time.Second))
-
-	if _, err := conn.Write(req); err != nil {
-		return nil, err
-	}
-
-	rr := resp.NewResponseReader(conn)
-	var last []byte
-	for i := 0; i < numResponses; i++ {
-		raw, err := rr.ReadResponse()
-		if err != nil {
-			return nil, err
-		}
-		last = raw
-	}
-	return last, nil
+	raw, err := pc.exchange(req, 10*time.Second)
+	c.releaseConn(addr, pc, err != nil)
+	return raw, err
 }
 
 // RefreshRing forces a refresh of the ring topology from the cluster.

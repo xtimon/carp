@@ -16,7 +16,7 @@ func (s *Storage) SAdd(key []byte, members ...[]byte) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.maybeExpireSet(key)
-	k := s.key(key)
+	k := string(key)
 	delete(s.tombs, k)
 	se := s.sets[k]
 	if se == nil {
@@ -39,7 +39,7 @@ func (s *Storage) SRem(key []byte, members ...[]byte) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.maybeExpireSet(key)
-	k := s.key(key)
+	k := string(key)
 	se := s.sets[k]
 	if se == nil {
 		return 0, nil
@@ -58,13 +58,12 @@ func (s *Storage) SRem(key []byte, members ...[]byte) (int, error) {
 	return removed, nil
 }
 
-// SIsMember returns 1 if member in set, 0 otherwise
+// SIsMember returns 1 if member in set, 0 otherwise (read-only).
 func (s *Storage) SIsMember(key, member []byte) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.maybeExpireSet(key)
-	se := s.sets[s.key(key)]
-	if se == nil {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	se := s.sets[string(key)]
+	if se == nil || expired(se.expire) {
 		return 0, nil
 	}
 	if se.members[string(member)] {
@@ -73,13 +72,12 @@ func (s *Storage) SIsMember(key, member []byte) (int, error) {
 	return 0, nil
 }
 
-// SMembers returns all members
+// SMembers returns all members (read-only).
 func (s *Storage) SMembers(key []byte) ([][]byte, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.maybeExpireSet(key)
-	se := s.sets[s.key(key)]
-	if se == nil {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	se := s.sets[string(key)]
+	if se == nil || expired(se.expire) {
 		return [][]byte{}, nil
 	}
 	out := make([][]byte, 0, len(se.members))
@@ -89,13 +87,12 @@ func (s *Storage) SMembers(key []byte) ([][]byte, error) {
 	return out, nil
 }
 
-// SCard returns set size
+// SCard returns set size (read-only).
 func (s *Storage) SCard(key []byte) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.maybeExpireSet(key)
-	se := s.sets[s.key(key)]
-	if se == nil {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	se := s.sets[string(key)]
+	if se == nil || expired(se.expire) {
 		return 0, nil
 	}
 	return len(se.members), nil
@@ -106,7 +103,7 @@ func (s *Storage) SPop(key []byte) ([]byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.maybeExpireSet(key)
-	k := s.key(key)
+	k := string(key)
 	se := s.sets[k]
 	if se == nil || len(se.members) == 0 {
 		return nil, nil
@@ -126,7 +123,7 @@ func (s *Storage) SPop(key []byte) ([]byte, error) {
 }
 
 func (s *Storage) maybeExpireSet(key []byte) {
-	k := s.key(key)
+	k := string(key)
 	se := s.sets[k]
 	if se == nil || se.expire == nil {
 		return

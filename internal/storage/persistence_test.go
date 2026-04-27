@@ -34,9 +34,10 @@ func TestSaveLoadRoundtrip(t *testing.T) {
 	if string(v2) != "v2" {
 		t.Errorf("k2 = %q, want v2", v2)
 	}
+	// Redis LPUSH a b → final order [b, a].
 	items, _ := s2.LRange([]byte("list1"), 0, -1)
-	if len(items) != 2 || string(items[0]) != "a" || string(items[1]) != "b" {
-		t.Errorf("list1 = %v, want [a b]", items)
+	if len(items) != 2 || string(items[0]) != "b" || string(items[1]) != "a" {
+		t.Errorf("list1 = %v, want [b a]", items)
 	}
 }
 

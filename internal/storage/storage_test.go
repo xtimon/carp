@@ -198,13 +198,15 @@ func TestStorage_LPush_LPop(t *testing.T) {
 	if n != 2 {
 		t.Errorf("LPush len = %d, want 2", n)
 	}
+	// Redis semantics: LPUSH a b pushes a first then b, so the final order is [b, a]
+	// — b ends up at the head and is the first to LPop.
 	got, _ := s.LPop(key)
-	if string(got) != "a" {
-		t.Errorf("LPop first = %q, want a (first pushed at head)", got)
+	if string(got) != "b" {
+		t.Errorf("LPop first = %q, want b (last value pushed lands at head)", got)
 	}
 	got, _ = s.LPop(key)
-	if string(got) != "b" {
-		t.Errorf("LPop second = %q, want b", got)
+	if string(got) != "a" {
+		t.Errorf("LPop second = %q, want a", got)
 	}
 	got, _ = s.LPop(key)
 	if got != nil {

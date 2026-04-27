@@ -42,7 +42,7 @@ func (s *Storage) ZAdd(key []byte, args [][]byte) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.maybeExpireZSet(key)
-	k := s.key(key)
+	k := string(key)
 	delete(s.tombs, k)
 	ze := s.zsets[k]
 	if ze == nil {
@@ -67,7 +67,7 @@ func (s *Storage) ZRem(key []byte, members ...[]byte) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.maybeExpireZSet(key)
-	k := s.key(key)
+	k := string(key)
 	ze := s.zsets[k]
 	if ze == nil {
 		return 0, nil
@@ -88,26 +88,24 @@ func (s *Storage) ZRem(key []byte, members ...[]byte) (int, error) {
 	return removed, nil
 }
 
-// ZScore returns member's score
+// ZScore returns member's score (read-only).
 func (s *Storage) ZScore(key, member []byte) (float64, bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.maybeExpireZSet(key)
-	ze := s.zsets[s.key(key)]
-	if ze == nil {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	ze := s.zsets[string(key)]
+	if ze == nil || expired(ze.expire) {
 		return 0, false, nil
 	}
 	score, ok := ze.scores[string(member)]
 	return score, ok, nil
 }
 
-// ZCard returns sorted set size
+// ZCard returns sorted set size (read-only).
 func (s *Storage) ZCard(key []byte) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.maybeExpireZSet(key)
-	ze := s.zsets[s.key(key)]
-	if ze == nil {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	ze := s.zsets[string(key)]
+	if ze == nil || expired(ze.expire) {
 		return 0, nil
 	}
 	return len(ze.scores), nil
@@ -118,7 +116,7 @@ func (s *Storage) ZRank(key, member []byte) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.maybeExpireZSet(key)
-	ze := s.zsets[s.key(key)]
+	ze := s.zsets[string(key)]
 	if ze == nil {
 		return -1, nil
 	}
@@ -140,7 +138,7 @@ func (s *Storage) ZRevRank(key, member []byte) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.maybeExpireZSet(key)
-	ze := s.zsets[s.key(key)]
+	ze := s.zsets[string(key)]
 	if ze == nil {
 		return -1, nil
 	}
@@ -163,7 +161,7 @@ func (s *Storage) ZRange(key []byte, start, stop int, withScores bool) ([][]byte
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.maybeExpireZSet(key)
-	ze := s.zsets[s.key(key)]
+	ze := s.zsets[string(key)]
 	if ze == nil {
 		return [][]byte{}, nil
 	}
@@ -196,7 +194,7 @@ func (s *Storage) ZRange(key []byte, start, stop int, withScores bool) ([][]byte
 }
 
 func (s *Storage) maybeExpireZSet(key []byte) {
-	k := s.key(key)
+	k := string(key)
 	ze := s.zsets[k]
 	if ze == nil || ze.expire == nil {
 		return

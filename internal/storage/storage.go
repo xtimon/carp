@@ -60,22 +60,24 @@ func New() *Storage {
 	}
 }
 
-func (s *Storage) key(k []byte) string { return string(k) }
+// expired reports whether the timestamp pointer indicates a past expiry.
+// Used by read paths so they don't have to delete (and therefore don't have
+// to take the write lock); the background sweeper handles eviction.
+func expired(t *time.Time) bool {
+	return t != nil && time.Now().After(*t)
+}
 
-// Get returns value or nil (tombstoned keys return nil)
+// Get returns value or nil (tombstoned keys return nil). Read-only path:
+// does not evict expired entries — that's the sweeper's job (see
+// RunExpiredKeysGC), so concurrent reads can run in parallel under RLock.
 func (s *Storage) Get(key []byte) ([]byte, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	k := s.key(key)
-	if _, ok := s.tombs[k]; ok {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if _, ok := s.tombs[string(key)]; ok {
 		return nil, nil
 	}
-	e, ok := s.data[k]
-	if !ok {
-		return nil, nil
-	}
-	if e.expire != nil && time.Now().After(*e.expire) {
-		delete(s.data, k)
+	e, ok := s.data[string(key)]
+	if !ok || expired(e.expire) {
 		return nil, nil
 	}
 	return e.value, nil
@@ -85,7 +87,7 @@ func (s *Storage) Get(key []byte) ([]byte, error) {
 func (s *Storage) Set(key, value []byte, ttlSeconds *int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	k := s.key(key)
+	k := string(key)
 	delete(s.tombs, k)
 	e := entry{value: value}
 	if ttlSeconds != nil && *ttlSeconds > 0 {
@@ -101,7 +103,7 @@ func (s *Storage) Set(key, value []byte, ttlSeconds *int) error {
 func (s *Storage) SetTombstone(key []byte) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	k := s.key(key)
+	k := string(key)
 	had := false
 	if _, ok := s.data[k]; ok {
 		delete(s.data, k)
@@ -145,6 +147,47 @@ func (s *Storage) RunTombstoneGC() int {
 	return n
 }
 
+// RunExpiredKeysGC sweeps all expired entries across every type. Read paths
+// no longer evict expired entries (so they can run under RLock); this
+// background sweep takes their place. Returns the number of entries removed.
+func (s *Storage) RunExpiredKeysGC() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	n := 0
+	for k, e := range s.data {
+		if e.expire != nil && now.After(*e.expire) {
+			delete(s.data, k)
+			n++
+		}
+	}
+	for k, le := range s.lists {
+		if le.expire != nil && now.After(*le.expire) {
+			delete(s.lists, k)
+			n++
+		}
+	}
+	for k, se := range s.sets {
+		if se.expire != nil && now.After(*se.expire) {
+			delete(s.sets, k)
+			n++
+		}
+	}
+	for k, he := range s.hashes {
+		if he.expire != nil && now.After(*he.expire) {
+			delete(s.hashes, k)
+			n++
+		}
+	}
+	for k, ze := range s.zsets {
+		if ze.expire != nil && now.After(*ze.expire) {
+			delete(s.zsets, k)
+			n++
+		}
+	}
+	return n
+}
+
 // RunIdempotencyGC purges expired idempotency cache entries. Without this the
 // map grows for every (key, token) pair that's never read again — Get clears
 // expired entries lazily, but tokens used only once would otherwise leak.
@@ -167,7 +210,7 @@ func (s *Storage) RunIdempotencyGC() int {
 func (s *Storage) Delete(key []byte) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	k := s.key(key)
+	k := string(key)
 	delete(s.tombs, k)
 	had := false
 	if _, ok := s.data[k]; ok {
@@ -193,33 +236,34 @@ func (s *Storage) Delete(key []byte) (bool, error) {
 	return had, nil
 }
 
-// Exists returns 1 if key exists, 0 otherwise (tombstoned keys return 0)
+// Exists returns 1 if key exists, 0 otherwise (tombstoned and expired keys return 0).
 func (s *Storage) Exists(key []byte) (int, error) {
-	s.mu.Lock()
-	s.maybeExpire(key)
-	s.maybeExpireList(key)
-	s.maybeExpireSet(key)
-	s.maybeExpireHash(key)
-	s.maybeExpireZSet(key)
-	k := s.key(key)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	k := string(key)
 	if _, ok := s.tombs[k]; ok {
-		s.mu.Unlock()
 		return 0, nil
 	}
-	_, inData := s.data[k]
-	_, inLists := s.lists[k]
-	_, inSets := s.sets[k]
-	_, inHashes := s.hashes[k]
-	_, inZsets := s.zsets[k]
-	s.mu.Unlock()
-	if inData || inLists || inSets || inHashes || inZsets {
+	if e, ok := s.data[k]; ok && !expired(e.expire) {
+		return 1, nil
+	}
+	if le, ok := s.lists[k]; ok && !expired(le.expire) {
+		return 1, nil
+	}
+	if se, ok := s.sets[k]; ok && !expired(se.expire) {
+		return 1, nil
+	}
+	if he, ok := s.hashes[k]; ok && !expired(he.expire) {
+		return 1, nil
+	}
+	if ze, ok := s.zsets[k]; ok && !expired(ze.expire) {
 		return 1, nil
 	}
 	return 0, nil
 }
 
 func (s *Storage) maybeExpire(key []byte) {
-	k := s.key(key)
+	k := string(key)
 	e, ok := s.data[k]
 	if !ok || e.expire == nil {
 		return
@@ -239,17 +283,19 @@ func keysMatch(pattern, key string) bool {
 	return matched
 }
 
-// Keys returns keys matching pattern (* = all, key:* = prefix, etc). Excludes tombstoned keys.
-// Two-pass: pass 1 collects matches and total byte size; pass 2 builds single pre-sized buffer
-// so all returned []byte slices point into one allocation (reduces allocations).
+// Keys returns keys matching pattern (* = all, key:* = prefix, etc). Excludes
+// tombstoned and expired keys. Read-only — does not evict expired entries.
+//
+// Two-pass: pass 1 collects matches and total byte size; pass 2 builds single
+// pre-sized buffer so all returned []byte slices point into one allocation.
 func (s *Storage) Keys(pattern []byte) ([][]byte, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	now := time.Now()
+	isExpired := func(t *time.Time) bool { return t != nil && now.After(*t) }
 	pat := string(pattern)
 	allMatch := pat == "*"
 
-	// Pass 1: collect matching keys (string refs, no copy) and total byte size
 	var keys []string
 	var totalLen int
 	collect := func(k string) {
@@ -259,51 +305,31 @@ func (s *Storage) Keys(pattern []byte) ([][]byte, error) {
 		}
 	}
 	for k, e := range s.data {
-		if _, ok := s.tombs[k]; ok {
-			continue
-		}
-		if e.expire != nil && now.After(*e.expire) {
-			delete(s.data, k)
+		if _, ok := s.tombs[k]; ok || isExpired(e.expire) {
 			continue
 		}
 		collect(k)
 	}
 	for k, le := range s.lists {
-		if _, ok := s.tombs[k]; ok {
-			continue
-		}
-		if le.expire != nil && now.After(*le.expire) {
-			delete(s.lists, k)
+		if _, ok := s.tombs[k]; ok || isExpired(le.expire) {
 			continue
 		}
 		collect(k)
 	}
 	for k, se := range s.sets {
-		if _, ok := s.tombs[k]; ok {
-			continue
-		}
-		if se.expire != nil && now.After(*se.expire) {
-			delete(s.sets, k)
+		if _, ok := s.tombs[k]; ok || isExpired(se.expire) {
 			continue
 		}
 		collect(k)
 	}
 	for k, he := range s.hashes {
-		if _, ok := s.tombs[k]; ok {
-			continue
-		}
-		if he.expire != nil && now.After(*he.expire) {
-			delete(s.hashes, k)
+		if _, ok := s.tombs[k]; ok || isExpired(he.expire) {
 			continue
 		}
 		collect(k)
 	}
 	for k, ze := range s.zsets {
-		if _, ok := s.tombs[k]; ok {
-			continue
-		}
-		if ze.expire != nil && now.After(*ze.expire) {
-			delete(s.zsets, k)
+		if _, ok := s.tombs[k]; ok || isExpired(ze.expire) {
 			continue
 		}
 		collect(k)
@@ -328,7 +354,7 @@ func (s *Storage) Incr(key []byte, delta int) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.maybeExpire(key)
-	k := s.key(key)
+	k := string(key)
 	delete(s.tombs, k)
 	e, ok := s.data[k]
 	val := 0
@@ -346,14 +372,9 @@ func (s *Storage) Incr(key []byte, delta int) (int, error) {
 
 // TTL returns -2 if not exists, -1 if no expire, else seconds (tombstoned = -2)
 func (s *Storage) TTL(key []byte) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.maybeExpire(key)
-	s.maybeExpireList(key)
-	s.maybeExpireSet(key)
-	s.maybeExpireHash(key)
-	s.maybeExpireZSet(key)
-	k := s.key(key)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	k := string(key)
 	if _, ok := s.tombs[k]; ok {
 		return -2, nil
 	}
@@ -390,7 +411,7 @@ func (s *Storage) Expire(key []byte, seconds int) (bool, error) {
 	s.maybeExpireSet(key)
 	s.maybeExpireHash(key)
 	s.maybeExpireZSet(key)
-	k := s.key(key)
+	k := string(key)
 	t := time.Now().Add(time.Duration(seconds) * time.Second)
 	if e, ok := s.data[k]; ok {
 		s.data[k] = entry{value: e.value, expire: &t}
@@ -415,13 +436,12 @@ func (s *Storage) Expire(key []byte, seconds int) (bool, error) {
 	return false, nil
 }
 
-// Strlen returns string length
+// Strlen returns string length (read-only).
 func (s *Storage) Strlen(key []byte) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.maybeExpire(key)
-	e, ok := s.data[s.key(key)]
-	if !ok {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	e, ok := s.data[string(key)]
+	if !ok || expired(e.expire) {
 		return 0, nil
 	}
 	return len(e.value), nil
@@ -432,7 +452,7 @@ func (s *Storage) Append(key, value []byte) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.maybeExpire(key)
-	k := s.key(key)
+	k := string(key)
 	delete(s.tombs, k)
 	e, ok := s.data[k]
 	if !ok {
@@ -444,13 +464,12 @@ func (s *Storage) Append(key, value []byte) (int, error) {
 	return len(e.value), nil
 }
 
-// GetRange returns substring [start:end] (inclusive)
+// GetRange returns substring [start:end] (inclusive). Read-only path.
 func (s *Storage) GetRange(key []byte, start, end int) ([]byte, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.maybeExpire(key)
-	e, ok := s.data[s.key(key)]
-	if !ok {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	e, ok := s.data[string(key)]
+	if !ok || expired(e.expire) {
 		return []byte{}, nil
 	}
 	n := len(e.value)
@@ -480,7 +499,7 @@ func (s *Storage) SetRange(key []byte, offset int, value []byte) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.maybeExpire(key)
-	k := s.key(key)
+	k := string(key)
 	delete(s.tombs, k)
 	e, ok := s.data[k]
 	if !ok {
@@ -560,7 +579,7 @@ func (s *Storage) IncrByWithIdempotency(key, token []byte, delta int) (int, erro
 func (s *Storage) SetNX(key, value []byte) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	k := s.key(key)
+	k := string(key)
 	if _, ok := s.data[k]; ok {
 		return 0, nil
 	}
@@ -574,7 +593,7 @@ func (s *Storage) GetSet(key, value []byte) ([]byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.maybeExpire(key)
-	k := s.key(key)
+	k := string(key)
 	delete(s.tombs, k)
 	old, _ := s.data[k]
 	s.data[k] = entry{value: append([]byte(nil), value...), expire: old.expire}
@@ -590,7 +609,7 @@ func (s *Storage) Persist(key []byte) (bool, error) {
 	s.maybeExpireSet(key)
 	s.maybeExpireHash(key)
 	s.maybeExpireZSet(key)
-	k := s.key(key)
+	k := string(key)
 	if e, ok := s.data[k]; ok {
 		s.data[k] = entry{value: e.value, expire: nil}
 		return true, nil
@@ -631,20 +650,23 @@ func (le *listEntry) listAt(i int) []byte {
 	return le.tail[i-hlen]
 }
 
-// LPUSH inserts values at head of list, returns new length (clears tombstone) — O(1) per value
+// LPUSH inserts values at head of list, returns new length (clears tombstone) — O(1) per value.
+// Redis semantics: each value pushed to the head in order, so LPUSH a b c yields [c,b,a].
+// Internally head is stored reversed (head[len-1] is logical index 0), so each value is just
+// appended in the order it arrives.
 func (s *Storage) LPush(key []byte, values ...[]byte) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.maybeExpireList(key)
-	k := s.key(key)
+	k := string(key)
 	delete(s.tombs, k)
 	le := s.lists[k]
 	if le == nil {
 		le = &listEntry{}
 		s.lists[k] = le
 	}
-	for i := len(values) - 1; i >= 0; i-- {
-		le.head = append(le.head, values[i])
+	for _, v := range values {
+		le.head = append(le.head, v)
 	}
 	return le.listLen(), nil
 }
@@ -654,7 +676,7 @@ func (s *Storage) RPush(key []byte, values ...[]byte) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.maybeExpireList(key)
-	k := s.key(key)
+	k := string(key)
 	delete(s.tombs, k)
 	le := s.lists[k]
 	if le == nil {
@@ -665,25 +687,23 @@ func (s *Storage) RPush(key []byte, values ...[]byte) (int, error) {
 	return le.listLen(), nil
 }
 
-// LLEN returns list length
+// LLEN returns list length (read-only).
 func (s *Storage) LLen(key []byte) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.maybeExpireList(key)
-	le := s.lists[s.key(key)]
-	if le == nil {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	le := s.lists[string(key)]
+	if le == nil || expired(le.expire) {
 		return 0, nil
 	}
 	return le.listLen(), nil
 }
 
-// LRANGE returns elements from start to stop (inclusive, Redis semantics)
+// LRANGE returns elements from start to stop (inclusive, Redis semantics). Read-only.
 func (s *Storage) LRange(key []byte, start, stop int) ([][]byte, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.maybeExpireList(key)
-	le := s.lists[s.key(key)]
-	if le == nil {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	le := s.lists[string(key)]
+	if le == nil || expired(le.expire) {
 		return nil, nil
 	}
 	n := le.listLen()
@@ -717,7 +737,7 @@ func (s *Storage) LPop(key []byte) ([]byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.maybeExpireList(key)
-	k := s.key(key)
+	k := string(key)
 	le := s.lists[k]
 	if le == nil || le.listLen() == 0 {
 		return nil, nil
@@ -742,7 +762,7 @@ func (s *Storage) RPop(key []byte) ([]byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.maybeExpireList(key)
-	k := s.key(key)
+	k := string(key)
 	le := s.lists[k]
 	if le == nil || le.listLen() == 0 {
 		return nil, nil
@@ -762,13 +782,12 @@ func (s *Storage) RPop(key []byte) ([]byte, error) {
 	return val, nil
 }
 
-// LIndex returns element at index
+// LIndex returns element at index (read-only).
 func (s *Storage) LIndex(key []byte, index int) ([]byte, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.maybeExpireList(key)
-	le := s.lists[s.key(key)]
-	if le == nil {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	le := s.lists[string(key)]
+	if le == nil || expired(le.expire) {
 		return nil, nil
 	}
 	v := le.listAt(index)
@@ -783,7 +802,7 @@ func (s *Storage) LSet(key []byte, index int, value []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.maybeExpireList(key)
-	le := s.lists[s.key(key)]
+	le := s.lists[string(key)]
 	if le == nil {
 		return errors.New("no such key")
 	}
@@ -832,7 +851,7 @@ func (s *Storage) LRem(key []byte, count int, value []byte) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.maybeExpireList(key)
-	k := s.key(key)
+	k := string(key)
 	le := s.lists[k]
 	if le == nil {
 		return 0, nil
@@ -879,7 +898,7 @@ func (s *Storage) LTrim(key []byte, start, stop int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.maybeExpireList(key)
-	k := s.key(key)
+	k := string(key)
 	le := s.lists[k]
 	if le == nil {
 		return nil
@@ -909,7 +928,7 @@ func (s *Storage) LTrim(key []byte, start, stop int) error {
 }
 
 func (s *Storage) maybeExpireList(key []byte) {
-	k := s.key(key)
+	k := string(key)
 	le := s.lists[k]
 	if le == nil || le.expire == nil {
 		return
@@ -919,95 +938,65 @@ func (s *Storage) maybeExpireList(key []byte) {
 	}
 }
 
-// Type returns "string", "list", "set", "zset", "hash", or "none"
+// Type returns "string", "list", "set", "zset", "hash", or "none". Read-only.
 func (s *Storage) Type(key []byte) string {
-	s.mu.Lock()
-	s.maybeExpire(key)
-	s.maybeExpireList(key)
-	s.maybeExpireSet(key)
-	s.maybeExpireHash(key)
-	s.maybeExpireZSet(key)
-	k := s.key(key)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	k := string(key)
 	if _, ok := s.tombs[k]; ok {
-		s.mu.Unlock()
 		return "none"
 	}
-	if _, ok := s.data[k]; ok {
-		s.mu.Unlock()
+	if e, ok := s.data[k]; ok && !expired(e.expire) {
 		return "string"
 	}
-	if _, ok := s.lists[k]; ok {
-		s.mu.Unlock()
+	if le, ok := s.lists[k]; ok && !expired(le.expire) {
 		return "list"
 	}
-	if _, ok := s.sets[k]; ok {
-		s.mu.Unlock()
+	if se, ok := s.sets[k]; ok && !expired(se.expire) {
 		return "set"
 	}
-	if _, ok := s.hashes[k]; ok {
-		s.mu.Unlock()
+	if he, ok := s.hashes[k]; ok && !expired(he.expire) {
 		return "hash"
 	}
-	if _, ok := s.zsets[k]; ok {
-		s.mu.Unlock()
+	if ze, ok := s.zsets[k]; ok && !expired(ze.expire) {
 		return "zset"
 	}
-	s.mu.Unlock()
 	return "none"
 }
 
-// DBSize returns total key count (excludes tombstoned keys)
+// DBSize returns total key count (excludes tombstoned and expired keys). Read-only.
 func (s *Storage) DBSize() (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	now := time.Now()
+	isExpired := func(t *time.Time) bool { return t != nil && now.After(*t) }
 	n := 0
 	for k, e := range s.data {
-		if _, ok := s.tombs[k]; ok {
-			continue
-		}
-		if e.expire != nil && now.After(*e.expire) {
-			delete(s.data, k)
+		if _, ok := s.tombs[k]; ok || isExpired(e.expire) {
 			continue
 		}
 		n++
 	}
 	for k, le := range s.lists {
-		if _, ok := s.tombs[k]; ok {
-			continue
-		}
-		if le.expire != nil && now.After(*le.expire) {
-			delete(s.lists, k)
+		if _, ok := s.tombs[k]; ok || isExpired(le.expire) {
 			continue
 		}
 		n++
 	}
 	for k, se := range s.sets {
-		if _, ok := s.tombs[k]; ok {
-			continue
-		}
-		if se.expire != nil && now.After(*se.expire) {
-			delete(s.sets, k)
+		if _, ok := s.tombs[k]; ok || isExpired(se.expire) {
 			continue
 		}
 		n++
 	}
 	for k, he := range s.hashes {
-		if _, ok := s.tombs[k]; ok {
-			continue
-		}
-		if he.expire != nil && now.After(*he.expire) {
-			delete(s.hashes, k)
+		if _, ok := s.tombs[k]; ok || isExpired(he.expire) {
 			continue
 		}
 		n++
 	}
 	for k, ze := range s.zsets {
-		if _, ok := s.tombs[k]; ok {
-			continue
-		}
-		if ze.expire != nil && now.After(*ze.expire) {
-			delete(s.zsets, k)
+		if _, ok := s.tombs[k]; ok || isExpired(ze.expire) {
 			continue
 		}
 		n++
@@ -1027,58 +1016,39 @@ func (s *Storage) FlushDB() {
 	s.tombs = make(map[string]time.Time)
 }
 
-// RandomKey returns a random key or nil (excludes tombstoned keys)
+// RandomKey returns a random key or nil (excludes tombstoned and expired keys). Read-only.
 func (s *Storage) RandomKey() ([]byte, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	now := time.Now()
+	isExpired := func(t *time.Time) bool { return t != nil && now.After(*t) }
 	var keys []string
 	for k, e := range s.data {
-		if _, ok := s.tombs[k]; ok {
-			continue
-		}
-		if e.expire != nil && now.After(*e.expire) {
-			delete(s.data, k)
+		if _, ok := s.tombs[k]; ok || isExpired(e.expire) {
 			continue
 		}
 		keys = append(keys, k)
 	}
 	for k, le := range s.lists {
-		if _, ok := s.tombs[k]; ok {
-			continue
-		}
-		if le.expire != nil && now.After(*le.expire) {
-			delete(s.lists, k)
+		if _, ok := s.tombs[k]; ok || isExpired(le.expire) {
 			continue
 		}
 		keys = append(keys, k)
 	}
 	for k, se := range s.sets {
-		if _, ok := s.tombs[k]; ok {
-			continue
-		}
-		if se.expire != nil && now.After(*se.expire) {
-			delete(s.sets, k)
+		if _, ok := s.tombs[k]; ok || isExpired(se.expire) {
 			continue
 		}
 		keys = append(keys, k)
 	}
 	for k, he := range s.hashes {
-		if _, ok := s.tombs[k]; ok {
-			continue
-		}
-		if he.expire != nil && now.After(*he.expire) {
-			delete(s.hashes, k)
+		if _, ok := s.tombs[k]; ok || isExpired(he.expire) {
 			continue
 		}
 		keys = append(keys, k)
 	}
 	for k, ze := range s.zsets {
-		if _, ok := s.tombs[k]; ok {
-			continue
-		}
-		if ze.expire != nil && now.After(*ze.expire) {
-			delete(s.zsets, k)
+		if _, ok := s.tombs[k]; ok || isExpired(ze.expire) {
 			continue
 		}
 		keys = append(keys, k)

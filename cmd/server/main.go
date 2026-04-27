@@ -16,6 +16,7 @@ import (
 
 	"github.com/carp/internal/auth"
 	"github.com/carp/internal/cluster"
+	"github.com/carp/internal/clusterauth"
 	"github.com/carp/internal/coordinator"
 	"github.com/carp/internal/partitioner"
 	"github.com/carp/internal/rebalance"
@@ -51,6 +52,7 @@ type nodeConfig struct {
 	TombstoneGraceSeconds int    `yaml:"tombstone_grace_seconds"`    // purge tombstones after N seconds; 0 = no GC
 	ClusterSecret         string `yaml:"cluster_secret"`             // HMAC secret for inter-node RPC + gossip; empty = legacy unauthenticated
 	RequirePass           string `yaml:"requirepass"`                // bcrypt hash for the default user (Redis-style shortcut for single-password auth)
+	RPCPoolSize           int    `yaml:"rpc_pool_size"`              // per-peer RPC connection pool ceiling; 0 = default (32)
 	Auth                  authConfig `yaml:"auth"`                   // multi-user config; empty = use requirepass or open mode
 	SeedNodes         []struct {
 		Host       string `yaml:"host"`
@@ -75,6 +77,7 @@ func loadConfig(path string) (*nodeConfig, error) {
 		TombstoneGraceSeconds:  getEnvInt("TOMBSTONE_GRACE_SECONDS", 60),
 		ClusterSecret:         getEnv("CARP_CLUSTER_SECRET", ""),
 		RequirePass:           getEnv("CARP_REQUIREPASS", ""),
+		RPCPoolSize:           getEnvInt("CARP_RPC_POOL_SIZE", 0),
 	}
 	if path != "" {
 		data, err := os.ReadFile(path)
@@ -129,6 +132,9 @@ func loadConfig(path string) (*nodeConfig, error) {
 				}
 				if file.RequirePass != "" {
 					cfg.RequirePass = file.RequirePass
+				}
+				if file.RPCPoolSize > 0 {
+					cfg.RPCPoolSize = file.RPCPoolSize
 				}
 				if len(file.Auth.Users) > 0 {
 					cfg.Auth = file.Auth
@@ -215,7 +221,12 @@ func main() {
 	if cfg.ClusterSecret == "" {
 		log.Fatal("[server] cluster_secret is required (set CARP_CLUSTER_SECRET env or cluster_secret in YAML)")
 	}
-	rpc.SetClusterSecret([]byte(cfg.ClusterSecret))
+	secretBytes := []byte(cfg.ClusterSecret)
+	rpc.SetClusterSecret(secretBytes)
+	clusterauth.SetPoolSecret(secretBytes)
+	if cfg.RPCPoolSize > 0 {
+		rpc.SetPoolSize(cfg.RPCPoolSize)
+	}
 	log.Printf("[server] Inter-node HMAC enabled (RPC + gossip)")
 
 	authRegistry, err := buildAuthRegistry(cfg)
@@ -350,6 +361,9 @@ func main() {
 					log.Printf("[server] Tombstone GC purged %d entries", n)
 				}
 				store.RunIdempotencyGC()
+				if n := store.RunExpiredKeysGC(); n > 0 {
+					log.Printf("[server] Expired-keys GC purged %d entries", n)
+				}
 			}
 		}()
 		log.Printf("[server] Tombstone grace period %ds (GC every %v)", cfg.TombstoneGraceSeconds, interval)
