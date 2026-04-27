@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/carp/internal/auth"
 	"github.com/carp/internal/cluster"
 	"github.com/carp/internal/partitioner"
 	"github.com/carp/internal/resp"
@@ -155,8 +156,20 @@ func (c *Coordinator) rpcWithRetry(r replica, cmd byte, args [][]byte) ([]byte, 
 // Flow: key-less commands (PING, etc) → single-key commands → extended (sets, hashes, zsets).
 // Consistency levels (ONE, QUORUM, ALL) control how many replicas must acknowledge reads/writes.
 // consistencyOverride is per-connection override (e.g. from CONSISTENCY command); nil uses default.
-func (c *Coordinator) Execute(cmdName []byte, args [][]byte, consistencyOverride *ConsistencyLevel) []byte {
+// principal is the authenticated user (nil = ACL disabled, used when caller has already vetted access).
+func (c *Coordinator) Execute(cmdName []byte, args [][]byte, consistencyOverride *ConsistencyLevel, principal *auth.User) []byte {
 	cmd := strings.ToUpper(string(cmdName))
+
+	if principal != nil {
+		if !principal.AllowsCommand(cmd, args) {
+			log.Printf("[acl] denied user=%q cmd=%s reason=role", principal.Name, cmd)
+			return resp.EncodeError("NOPERM this user has no permissions to run the '" + strings.ToLower(cmd) + "' command")
+		}
+		if denied := firstDeniedKey(principal, cmd, args); denied != nil {
+			log.Printf("[acl] denied user=%q cmd=%s key=%q reason=keys", principal.Name, cmd, denied)
+			return resp.EncodeError("NOPERM this user has no permissions to access one of the keys used as arguments")
+		}
+	}
 
 	// Key-less commands: no partition lookup
 	switch cmd {
@@ -534,6 +547,11 @@ func (c *Coordinator) Execute(cmdName []byte, args [][]byte, consistencyOverride
 		var items [][]byte
 		for k := range seen {
 			items = append(items, []byte(k))
+		}
+		// Apply per-user key-prefix scoping so a restricted user only sees
+		// keys inside their allowed namespaces.
+		if principal != nil {
+			items = principal.FilterKeys(items)
 		}
 		return resp.EncodeArray(items)
 	}
@@ -1645,6 +1663,59 @@ func (c *Coordinator) execZSetLocal(cmd string, key []byte, args [][]byte) []byt
 		return []byte(strconv.Itoa(n))
 	}
 	return nil
+}
+
+// firstDeniedKey returns the first key in args that the user is NOT allowed
+// to access for this command, or nil if everything passes (or the command
+// has no per-key check). Used for fail-fast ACL key denial.
+func firstDeniedKey(u *auth.User, cmd string, args [][]byte) []byte {
+	if u == nil || len(u.Keys) == 0 {
+		return nil // unrestricted user — no per-key check needed
+	}
+	switch cmd {
+	// MSET: args are key,value,key,value,...
+	case "MSET":
+		for i := 0; i+1 < len(args); i += 2 {
+			if !u.AllowsKey(args[i]) {
+				return args[i]
+			}
+		}
+		return nil
+	// DEL, MGET, EXISTS: every arg is a key.
+	case "DEL", "MGET":
+		for _, k := range args {
+			if !u.AllowsKey(k) {
+				return k
+			}
+		}
+		return nil
+	// KEYS: arg is a pattern, not a key. Filtering happens at result time.
+	case "KEYS":
+		return nil
+	}
+	// Single-key commands: first arg is the key.
+	if singleKeyCmds[cmd] {
+		if len(args) >= 1 && !u.AllowsKey(args[0]) {
+			return args[0]
+		}
+	}
+	return nil
+}
+
+// singleKeyCmds is the set of commands whose first arg is the affected key.
+// Multi-key commands (DEL, MGET, MSET, KEYS) are handled separately above.
+var singleKeyCmds = map[string]bool{
+	"GET": true, "SET": true, "SETEX": true, "SETNX": true, "GETSET": true,
+	"EXISTS": true, "EXPIRE": true, "TTL": true, "PERSIST": true,
+	"TYPE": true, "STRLEN": true, "APPEND": true, "GETRANGE": true, "SETRANGE": true,
+	"INCR": true, "INCRBY": true, "DECR": true, "DECRBY": true,
+	"LPUSH": true, "RPUSH": true, "LPOP": true, "RPOP": true, "LLEN": true,
+	"LRANGE": true, "LINDEX": true, "LSET": true, "LREM": true, "LTRIM": true,
+	"SADD": true, "SREM": true, "SISMEMBER": true, "SMEMBERS": true, "SCARD": true, "SPOP": true,
+	"HSET": true, "HGET": true, "HMSET": true, "HMGET": true, "HGETALL": true,
+	"HDEL": true, "HEXISTS": true, "HLEN": true, "HKEYS": true, "HVALS": true,
+	"ZADD": true, "ZREM": true, "ZRANGE": true, "ZRANK": true, "ZREVRANK": true,
+	"ZSCORE": true, "ZCARD": true,
 }
 
 // parseLRangeResponse decodes RPC wire format: [4-byte item count][4-byte len][bytes]... per item.

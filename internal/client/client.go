@@ -43,6 +43,9 @@ type Client struct {
 
 	consistency ConsistencyLevel // session default; 0 = server default (QUORUM)
 
+	username string // optional; empty + password set => uses "default"
+	password string // optional; when non-empty, AUTH is sent on every new connection
+
 	connectTimeout time.Duration
 	retryBackoff   time.Duration
 	maxRetries     int
@@ -79,6 +82,15 @@ func (c *Client) SetConsistencyLevel(level ConsistencyLevel) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.consistency = level
+}
+
+// SetCredentials configures AUTH credentials sent on every new connection.
+// username may be empty for the `default` user. password "" disables auth.
+func (c *Client) SetCredentials(username, password string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.username = username
+	c.password = password
 }
 
 // consistencyLevelString returns the server string for the level.
@@ -371,17 +383,33 @@ func (c *Client) Do(cmd string, args ...[]byte) ([]byte, error) {
 }
 
 // buildRequest returns encoded command(s) and how many responses to expect.
-// If consistency is set, pipelines CONSISTENCY + command (2 responses).
+// AUTH (if credentials set) and CONSISTENCY (if non-default) are pipelined
+// before the main command — each adds one to numResponses.
 func (c *Client) buildRequest(cmd string, args [][]byte) ([]byte, int) {
 	c.mu.RLock()
 	cl := c.consistency
+	pw := c.password
+	user := c.username
 	c.mu.RUnlock()
-	if cl == ConsistencyLevelDefault || consistencyLevelString(cl) == "" {
-		return resp.EncodeCommand(cmd, args...), 1
+
+	var pipelined []byte
+	numResponses := 1
+	if pw != "" {
+		var authArgs [][]byte
+		if user != "" {
+			authArgs = [][]byte{[]byte(user), []byte(pw)}
+		} else {
+			authArgs = [][]byte{[]byte(pw)}
+		}
+		pipelined = append(pipelined, resp.EncodeCommand("AUTH", authArgs...)...)
+		numResponses++
 	}
-	consistencyCmd := resp.EncodeCommand("CONSISTENCY", []byte(consistencyLevelString(cl)))
-	mainCmd := resp.EncodeCommand(cmd, args...)
-	return append(consistencyCmd, mainCmd...), 2
+	if cl != ConsistencyLevelDefault && consistencyLevelString(cl) != "" {
+		pipelined = append(pipelined, resp.EncodeCommand("CONSISTENCY", []byte(consistencyLevelString(cl)))...)
+		numResponses++
+	}
+	pipelined = append(pipelined, resp.EncodeCommand(cmd, args...)...)
+	return pipelined, numResponses
 }
 
 func (c *Client) sendToNode(addr string, req []byte, numResponses int) ([]byte, error) {

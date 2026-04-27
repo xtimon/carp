@@ -1,7 +1,6 @@
 package cluster
 
 import (
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -11,6 +10,8 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/carp/internal/clusterauth"
 )
 
 // NodeState is the EndpointState for a node (Cassandra-inspired).
@@ -61,6 +62,13 @@ type Gossip struct {
 	version int64 // monotonic; bumped each round for self
 	running bool
 	stopCh  chan struct{}
+
+	clusterSecret []byte // HMAC key for gossip frames; nil = legacy unauthenticated
+}
+
+// SetClusterSecret enables HMAC framing for gossip messages. Call before Start().
+func (g *Gossip) SetClusterSecret(secret []byte) {
+	g.clusterSecret = secret
 }
 
 // NewGossip creates a Gossip instance. Generation = startup timestamp.
@@ -522,8 +530,6 @@ func (g *Gossip) gossipRound() {
 		"cluster_name": g.ClusterName,
 		"nodes":        g.SerializeState(),
 	})
-	lenBuf := make([]byte, 4)
-	binary.BigEndian.PutUint32(lenBuf, uint32(len(payload)))
 
 	for _, t := range targets {
 		conn, err := net.DialTimeout("tcp", t.addr, 2*time.Second)
@@ -533,21 +539,12 @@ func (g *Gossip) gossipRound() {
 		}
 		conn.SetDeadline(time.Now().Add(5 * time.Second))
 
-		if _, err := conn.Write(lenBuf); err != nil {
+		if err := clusterauth.WriteFrame(conn, g.clusterSecret, payload); err != nil {
 			conn.Close()
 			continue
 		}
-		if _, err := conn.Write(payload); err != nil {
-			conn.Close()
-			continue
-		}
-		if _, err := conn.Read(lenBuf); err != nil {
-			conn.Close()
-			continue
-		}
-		respLen := binary.BigEndian.Uint32(lenBuf)
-		respBuf := make([]byte, respLen)
-		if _, err := conn.Read(respBuf); err != nil {
+		respBuf, err := clusterauth.ReadFrame(conn, g.clusterSecret)
+		if err != nil {
 			conn.Close()
 			continue
 		}
@@ -662,13 +659,8 @@ func (s *GossipServer) Start() error {
 
 func (s *GossipServer) handleConn(conn net.Conn) {
 	defer conn.Close()
-	lenBuf := make([]byte, 4)
-	if _, err := conn.Read(lenBuf); err != nil {
-		return
-	}
-	msgLen := binary.BigEndian.Uint32(lenBuf)
-	msg := make([]byte, msgLen)
-	if _, err := conn.Read(msg); err != nil {
+	msg, err := clusterauth.ReadFrame(conn, s.gossip.clusterSecret)
+	if err != nil || len(msg) == 0 {
 		return
 	}
 	var data struct {
@@ -691,9 +683,7 @@ func (s *GossipServer) handleConn(conn net.Conn) {
 		"cluster_name": s.gossip.ClusterName,
 		"nodes":        s.gossip.SerializeState(),
 	})
-	binary.BigEndian.PutUint32(lenBuf, uint32(len(reply)))
-	conn.Write(lenBuf)
-	conn.Write(reply)
+	clusterauth.WriteFrame(conn, s.gossip.clusterSecret, reply)
 }
 
 // Close stops the server

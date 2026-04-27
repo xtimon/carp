@@ -4,20 +4,27 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
-	"io"
 	"net"
 	"strconv"
 	"sync"
 	"time"
 
+	"github.com/carp/internal/clusterauth"
 	"github.com/carp/internal/storage"
 )
 
 const rpcPoolSize = 8 // max pooled connections per addr to limit port usage
 
-// maxRPCMessageSize caps an RPC frame so a hostile/buggy peer can't push us
-// into a multi-GB allocation by lying about message length.
-const maxRPCMessageSize = 64 * 1024 * 1024
+// clusterSecret authenticates RPC frames between nodes. nil/empty disables
+// HMAC framing (legacy mode). Set once at startup via SetClusterSecret.
+var clusterSecret []byte
+
+// SetClusterSecret configures the cluster-wide HMAC secret for RPC frames.
+// Call this once at startup before serving RPC; it is not safe to change at
+// runtime while connections are open.
+func SetClusterSecret(secret []byte) {
+	clusterSecret = secret
+}
 
 var (
 	poolMu  sync.Mutex
@@ -98,34 +105,13 @@ func SendCommand(host string, redisPort int, cmd byte, args [][]byte) ([]byte, e
 	}()
 	conn.SetDeadline(time.Now().Add(5 * time.Second))
 	msg := packCommand(cmd, args)
-	lenBuf := make([]byte, 4)
-	binary.BigEndian.PutUint32(lenBuf, uint32(len(msg)))
-	if _, err := conn.Write(lenBuf); err != nil {
+	if err := clusterauth.WriteFrame(conn, clusterSecret, msg); err != nil {
 		conn.Close()
 		conn = nil
 		return nil, err
 	}
-	if _, err := conn.Write(msg); err != nil {
-		conn.Close()
-		conn = nil
-		return nil, err
-	}
-	if _, err := io.ReadFull(conn, lenBuf); err != nil {
-		conn.Close()
-		conn = nil
-		return nil, err
-	}
-	respLen := binary.BigEndian.Uint32(lenBuf)
-	if respLen == 0 {
-		return nil, nil
-	}
-	if respLen > maxRPCMessageSize {
-		conn.Close()
-		conn = nil
-		return nil, errors.New("rpc response too large")
-	}
-	resp := make([]byte, respLen)
-	if _, err := io.ReadFull(conn, resp); err != nil {
+	resp, err := clusterauth.ReadFrame(conn, clusterSecret)
+	if err != nil {
 		conn.Close()
 		conn = nil
 		return nil, err
@@ -187,16 +173,8 @@ type Handler struct {
 func HandleConn(conn net.Conn, h *Handler) {
 	store := h.Store
 	defer conn.Close()
-	lenBuf := make([]byte, 4)
-	if _, err := io.ReadFull(conn, lenBuf); err != nil {
-		return
-	}
-	msgLen := binary.BigEndian.Uint32(lenBuf)
-	if msgLen == 0 || msgLen > maxRPCMessageSize {
-		return
-	}
-	msg := make([]byte, msgLen)
-	if _, err := io.ReadFull(conn, msg); err != nil {
+	msg, err := clusterauth.ReadFrame(conn, clusterSecret)
+	if err != nil || len(msg) == 0 {
 		return
 	}
 	cmd, args, err := unpackCommand(msg)
@@ -653,7 +631,5 @@ func HandleConn(conn net.Conn, h *Handler) {
 	if result == nil {
 		result = []byte{}
 	}
-	binary.BigEndian.PutUint32(lenBuf, uint32(len(result)))
-	conn.Write(lenBuf)
-	conn.Write(result)
+	clusterauth.WriteFrame(conn, clusterSecret, result)
 }

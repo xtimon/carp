@@ -14,6 +14,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/carp/internal/auth"
 	"github.com/carp/internal/cluster"
 	"github.com/carp/internal/coordinator"
 	"github.com/carp/internal/partitioner"
@@ -22,6 +23,17 @@ import (
 	"github.com/carp/internal/rpc"
 	"github.com/carp/internal/storage"
 )
+
+type userConfig struct {
+	Name         string   `yaml:"name"`
+	PasswordHash string   `yaml:"password_hash"`
+	Role         string   `yaml:"role"` // admin | readwrite | readonly | none; default = readwrite
+	Keys         []string `yaml:"keys"` // pattern list (e.g. "app1:*"); empty = all keys
+}
+
+type authConfig struct {
+	Users []userConfig `yaml:"users"`
+}
 
 type nodeConfig struct {
 	NodeID            string `yaml:"node_id"`
@@ -37,6 +49,9 @@ type nodeConfig struct {
 	DBFilename            string `yaml:"dbfilename"`                // RDB filename (default: dump.rdb)
 	SaveInterval          int    `yaml:"save_interval"`              // auto-save every N seconds; 0 = disabled
 	TombstoneGraceSeconds int    `yaml:"tombstone_grace_seconds"`    // purge tombstones after N seconds; 0 = no GC
+	ClusterSecret         string `yaml:"cluster_secret"`             // HMAC secret for inter-node RPC + gossip; empty = legacy unauthenticated
+	RequirePass           string `yaml:"requirepass"`                // bcrypt hash for the default user (Redis-style shortcut for single-password auth)
+	Auth                  authConfig `yaml:"auth"`                   // multi-user config; empty = use requirepass or open mode
 	SeedNodes         []struct {
 		Host       string `yaml:"host"`
 		GossipPort int    `yaml:"gossip_port"`
@@ -58,6 +73,8 @@ func loadConfig(path string) (*nodeConfig, error) {
 		DBFilename:        getEnv("DBFILENAME", "dump.rdb"),
 		SaveInterval:          getEnvInt("SAVE_INTERVAL", 0),
 		TombstoneGraceSeconds:  getEnvInt("TOMBSTONE_GRACE_SECONDS", 60),
+		ClusterSecret:         getEnv("CARP_CLUSTER_SECRET", ""),
+		RequirePass:           getEnv("CARP_REQUIREPASS", ""),
 	}
 	if path != "" {
 		data, err := os.ReadFile(path)
@@ -106,6 +123,15 @@ func loadConfig(path string) (*nodeConfig, error) {
 				}
 				if file.TombstoneGraceSeconds > 0 {
 					cfg.TombstoneGraceSeconds = file.TombstoneGraceSeconds
+				}
+				if file.ClusterSecret != "" {
+					cfg.ClusterSecret = file.ClusterSecret
+				}
+				if file.RequirePass != "" {
+					cfg.RequirePass = file.RequirePass
+				}
+				if len(file.Auth.Users) > 0 {
+					cfg.Auth = file.Auth
 				}
 			}
 		}
@@ -186,6 +212,16 @@ func main() {
 		log.Fatal(err)
 	}
 
+	if cfg.ClusterSecret != "" {
+		rpc.SetClusterSecret([]byte(cfg.ClusterSecret))
+		log.Printf("[server] Inter-node HMAC enabled (RPC + gossip)")
+	}
+
+	authRegistry := buildAuthRegistry(cfg)
+	if authRegistry.AuthRequired() {
+		log.Printf("[server] Client AUTH required")
+	}
+
 	store := storage.New()
 	if cfg.TombstoneGraceSeconds > 0 {
 		store.TombstoneGracePeriod = time.Duration(cfg.TombstoneGraceSeconds) * time.Second
@@ -199,6 +235,9 @@ func main() {
 		log.Printf("[server] Loaded RDB from %s", rdbPath)
 	}
 	gossip := cluster.NewGossip(cfg.NodeID, cfg.Host, cfg.Port, cfg.GossipPort, cfg.ClusterName, cfg.Rack)
+	if cfg.ClusterSecret != "" {
+		gossip.SetClusterSecret([]byte(cfg.ClusterSecret))
+	}
 	part := partitioner.NewPartitioner(cfg.ReplicationFactor)
 	if cfg.NumVnodes > 0 {
 		part.SetNumVnodes(cfg.NumVnodes)
@@ -338,15 +377,50 @@ func main() {
 			log.Print(err)
 			continue
 		}
-		go handleRESP(conn, coord)
+		go handleRESP(conn, coord, authRegistry)
 	}
 }
 
-func handleRESP(conn net.Conn, coord *coordinator.Coordinator) {
+// buildAuthRegistry resolves config (requirepass + auth.users) into a Registry.
+// Precedence: explicit auth.users wins; otherwise requirepass becomes the
+// default user's password; otherwise the registry is in open mode.
+//
+// Role parsing: any unrecognized role causes Fatal — fail-fast on misconfig
+// rather than silently demoting a user to no access.
+func buildAuthRegistry(cfg *nodeConfig) *auth.Registry {
+	var users []auth.User
+	for _, u := range cfg.Auth.Users {
+		if u.Name == "" {
+			continue
+		}
+		role, ok := auth.ParseRole(u.Role)
+		if !ok {
+			log.Fatalf("[server] invalid role %q for user %q", u.Role, u.Name)
+		}
+		users = append(users, auth.User{
+			Name:         u.Name,
+			PasswordHash: u.PasswordHash,
+			Role:         role,
+			Keys:         auth.CompilePatterns(u.Keys),
+		})
+	}
+	if len(users) == 0 && cfg.RequirePass != "" {
+		// Single-password mode: treat as full-access default user.
+		users = append(users, auth.User{
+			Name:         "default",
+			PasswordHash: cfg.RequirePass,
+			Role:         auth.RoleAdmin,
+		})
+	}
+	return auth.NewRegistry(users)
+}
+
+func handleRESP(conn net.Conn, coord *coordinator.Coordinator, reg *auth.Registry) {
 	defer conn.Close()
 	reader := resp.Reader{}
 	buf := make([]byte, 65536)
 	var connConsistency *coordinator.ConsistencyLevel
+	session := auth.NewSession(reg)
 	for {
 		n, err := conn.Read(buf)
 		if err != nil || n == 0 {
@@ -360,6 +434,43 @@ func handleRESP(conn net.Conn, coord *coordinator.Coordinator) {
 			cmdName := cmd[0]
 			args := cmd[1:]
 			cmdStr := strings.ToUpper(string(cmdName))
+
+			// AUTH and HELLO are handled at the RESP layer because they mutate
+			// per-connection state (the session). PING and the read-only
+			// CLUSTER metadata subcommands are allowed pre-auth so health
+			// probes and ring-aware clients can bootstrap before AUTH.
+			switch cmdStr {
+			case "AUTH":
+				conn.Write(handleAuth(session, reg, args, conn.RemoteAddr().String()))
+				if session.FailedAuth() >= auth.MaxFailedAuth {
+					log.Printf("[auth] dropping %s: %d failed AUTH attempts", conn.RemoteAddr(), session.FailedAuth())
+					return
+				}
+				continue
+			case "HELLO":
+				conn.Write(handleHello(session, reg, args, conn.RemoteAddr().String()))
+				if session.FailedAuth() >= auth.MaxFailedAuth {
+					log.Printf("[auth] dropping %s: %d failed AUTH attempts", conn.RemoteAddr(), session.FailedAuth())
+					return
+				}
+				continue
+			case "PING":
+				conn.Write(resp.EncodeSimpleString("PONG"))
+				continue
+			case "QUIT":
+				conn.Write(resp.EncodeSimpleString("OK"))
+				return
+			}
+
+			principal := session.User()
+			if principal == nil {
+				if !preAuthAllowed(cmdStr, args) {
+					conn.Write(resp.EncodeError("NOAUTH Authentication required."))
+					continue
+				}
+				principal = auth.GuestUser()
+			}
+
 			if cmdStr == "CONSISTENCY" {
 				if len(args) < 1 {
 					conn.Write(resp.EncodeError("wrong number of arguments for 'consistency' command"))
@@ -373,8 +484,82 @@ func handleRESP(conn net.Conn, coord *coordinator.Coordinator) {
 				}
 				continue
 			}
-			response := coord.Execute(cmdName, args, connConsistency)
+			response := coord.Execute(cmdName, args, connConsistency, principal)
 			conn.Write(response)
 		}
 	}
+}
+
+// preAuthAllowed returns true for commands that are world-readable for
+// healthchecks and client bootstrap — INFO and the read-only CLUSTER
+// metadata subcommands. Mutating CLUSTER subcommands (LEAVE, REPAIR,
+// TOMBSTONE) still require auth; the @admin gate in Phase 4 narrows them
+// further.
+func preAuthAllowed(cmd string, args [][]byte) bool {
+	switch cmd {
+	case "INFO":
+		return true
+	case "CLUSTER":
+		if len(args) < 1 {
+			return false
+		}
+		switch strings.ToUpper(string(args[0])) {
+		case "INFO", "NODES", "RING", "KEYSLOT", "TOKEN", "KEYNODE":
+			return true
+		}
+	}
+	return false
+}
+
+// handleAuth implements `AUTH <pw>` (default user) and `AUTH <user> <pw>`.
+func handleAuth(session *auth.Session, reg *auth.Registry, args [][]byte, peer string) []byte {
+	var name string
+	var pw []byte
+	switch len(args) {
+	case 1:
+		name = "default"
+		pw = args[0]
+	case 2:
+		name = string(args[0])
+		pw = args[1]
+	default:
+		return resp.EncodeError("wrong number of arguments for 'auth' command")
+	}
+	u, err := reg.Authenticate(name, pw)
+	if err != nil {
+		n := session.RecordAuthFailure()
+		log.Printf("[auth] AUTH failure for user=%q peer=%s attempts=%d", name, peer, n)
+		return resp.EncodeError(err.Error())
+	}
+	session.SetUser(u)
+	return resp.EncodeSimpleString("OK")
+}
+
+// handleHello implements `HELLO [protover [AUTH user pw] [SETNAME name]]`.
+// We only honor the AUTH part (RESP3 negotiation is out of scope).
+func handleHello(session *auth.Session, reg *auth.Registry, args [][]byte, peer string) []byte {
+	for i := 0; i < len(args); i++ {
+		if strings.EqualFold(string(args[i]), "AUTH") {
+			if i+2 >= len(args) {
+				return resp.EncodeError("Syntax error in HELLO AUTH")
+			}
+			name := string(args[i+1])
+			u, err := reg.Authenticate(name, args[i+2])
+			if err != nil {
+				n := session.RecordAuthFailure()
+				log.Printf("[auth] HELLO AUTH failure for user=%q peer=%s attempts=%d", name, peer, n)
+				return resp.EncodeError(err.Error())
+			}
+			session.SetUser(u)
+			i += 2
+		}
+	}
+	if reg.AuthRequired() && !session.Authenticated() {
+		return resp.EncodeError("NOAUTH Authentication required.")
+	}
+	// Minimal handshake response (a few key fields redis-cli expects).
+	return resp.EncodeArray([][]byte{
+		[]byte("server"), []byte("carp"),
+		[]byte("proto"), []byte("2"),
+	})
 }

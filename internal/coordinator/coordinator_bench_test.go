@@ -21,7 +21,7 @@ func BenchmarkCoordinator_Execute_PING(b *testing.B) {
 	cmd := []byte("PING")
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		c.Execute(cmd, nil, nil)
+		c.Execute(cmd, nil, nil, nil)
 	}
 }
 
@@ -33,7 +33,7 @@ func BenchmarkCoordinator_Execute_GET(b *testing.B) {
 	args := [][]byte{key}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		c.Execute(cmd, args, nil)
+		c.Execute(cmd, args, nil, nil)
 	}
 }
 
@@ -45,7 +45,7 @@ func BenchmarkCoordinator_Execute_SET(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		args := [][]byte{key, val}
-		c.Execute(cmd, args, nil)
+		c.Execute(cmd, args, nil, nil)
 	}
 }
 
@@ -57,7 +57,7 @@ func BenchmarkCoordinator_Execute_INCR(b *testing.B) {
 	args := [][]byte{key}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		c.Execute(cmd, args, nil)
+		c.Execute(cmd, args, nil, nil)
 	}
 }
 
@@ -70,7 +70,7 @@ func BenchmarkCoordinator_Execute_INCRBY(b *testing.B) {
 	args := [][]byte{key, delta}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		c.Execute(cmd, args, nil)
+		c.Execute(cmd, args, nil, nil)
 	}
 }
 
@@ -80,7 +80,7 @@ func BenchmarkCoordinator_Execute_ECHO(b *testing.B) {
 	args := [][]byte{[]byte("hello")}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		c.Execute(cmd, args, nil)
+		c.Execute(cmd, args, nil, nil)
 	}
 }
 
@@ -92,7 +92,7 @@ func BenchmarkCoordinator_Execute_DBSIZE(b *testing.B) {
 	cmd := []byte("DBSIZE")
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		c.Execute(cmd, nil, nil)
+		c.Execute(cmd, nil, nil, nil)
 	}
 }
 
@@ -105,6 +105,6 @@ func BenchmarkCoordinator_Execute_KEYS(b *testing.B) {
 	args := [][]byte{[]byte("*")}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		c.Execute(cmd, args, nil)
+		c.Execute(cmd, args, nil, nil)
 	}
 }
