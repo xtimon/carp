@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"sync/atomic"
 )
 
 // DefaultNumVnodes is the number of virtual nodes per physical node for better distribution
@@ -66,18 +67,35 @@ type RingEntry struct {
 	NodeID string
 }
 
-// Partitioner manages consistent-hash ring with virtual nodes
+// ringSnapshot is the immutable, lookup-optimized form of the ring.
+// SetNodes publishes a new snapshot atomically; GetReplicas reads it lock-free.
+// The replicas field caches the rack-aware replica list for each ring entry
+// (replicas[i] is the result for any token that lands on entry i), so the hot
+// path is a binary search + slice return — no allocations, no map ops.
+//
+// Slices in `replicas` are shared with all callers; treat them as immutable.
+type ringSnapshot struct {
+	ring     []RingEntry
+	replicas [][]string
+}
+
+// Partitioner manages consistent-hash ring with virtual nodes.
+//
+// Writes (SetNodes) take `mu` to serialize snapshot construction.
+// Reads (GetReplicas) use the atomic snap pointer — no lock, no allocation.
 type Partitioner struct {
-	mu                sync.RWMutex
+	mu                sync.Mutex
 	ReplicationFactor int
 	NumVnodes         int
-	ring              []RingEntry
-	rackMap           map[string]string // nodeID -> rack for replica diversity
+	rackMap           map[string]string // nodeID -> rack for replica diversity (under mu)
+	snap              atomic.Pointer[ringSnapshot]
 }
 
 // NewPartitioner creates a partitioner
 func NewPartitioner(rf int) *Partitioner {
-	return &Partitioner{ReplicationFactor: rf, NumVnodes: DefaultNumVnodes}
+	p := &Partitioner{ReplicationFactor: rf, NumVnodes: DefaultNumVnodes}
+	p.snap.Store(&ringSnapshot{})
+	return p
 }
 
 // SetNumVnodes sets the number of virtual nodes per physical node
@@ -89,86 +107,79 @@ func (p *Partitioner) SetNumVnodes(n int) {
 }
 
 // SetNodes updates the ring with node IDs using vnodes for better distribution.
-// rackMap maps nodeID -> rack; if non-nil, GetReplicas prefers spreading replicas across racks.
+// rackMap maps nodeID -> rack; if non-nil, replica selection prefers spreading
+// replicas across racks. Builds a fresh immutable snapshot — concurrent
+// GetReplicas readers see the old snapshot until the atomic store completes.
 func (p *Partitioner) SetNodes(nodeIDs []string, rackMap map[string]string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.ring = nil
 	p.rackMap = rackMap
 	vnodes := p.NumVnodes
 	if vnodes < 1 {
 		vnodes = 1
 	}
+	ring := make([]RingEntry, 0, len(nodeIDs)*vnodes)
 	for _, nid := range nodeIDs {
 		for v := 0; v < vnodes; v++ {
 			vnodeKey := []byte(fmt.Sprintf("%s:%d", nid, v))
 			token := int(murmur3_32(vnodeKey, 0))
-			p.ring = append(p.ring, RingEntry{Token: token, NodeID: nid})
+			ring = append(ring, RingEntry{Token: token, NodeID: nid})
 		}
 	}
-	sort.Slice(p.ring, func(i, j int) bool { return p.ring[i].Token < p.ring[j].Token })
+	sort.Slice(ring, func(i, j int) bool { return ring[i].Token < ring[j].Token })
+
+	replicas := make([][]string, len(ring))
+	for i := range ring {
+		replicas[i] = computeReplicas(ring, i, p.ReplicationFactor, rackMap)
+	}
+	p.snap.Store(&ringSnapshot{ring: ring, replicas: replicas})
 }
 
-// GetReplicas returns replica nodes for a key (clockwise from token on the ring).
-// When rackMap is set, uses three-step rack-aware selection:
-// 1) primary = first node; 2) add nodes from racks not yet used; 3) fill remaining with any nodes.
-func (p *Partitioner) GetReplicas(key []byte) []string {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	if len(p.ring) == 0 {
+// computeReplicas runs the rack-aware selection for a startIdx into the ring.
+// Three-step: 1) primary = ring[startIdx]; 2) add nodes from racks not yet
+// used (rack diversity); 3) fill remaining slots with any unused nodes.
+// When rackMap is empty, just returns the first RF unique nodes in ring order.
+func computeReplicas(ring []RingEntry, startIdx int, rf int, rackMap map[string]string) []string {
+	if len(ring) == 0 || rf <= 0 {
 		return nil
 	}
-	token := TokenForKey(key)
-	startIdx := 0
-	for i, e := range p.ring {
-		if e.Token >= token {
-			startIdx = i
-			break
-		}
-	}
-
-	// Collect unique node IDs in clockwise ring order
-	var candidates []string
-	seen := make(map[string]bool)
-	for i := 0; i < len(p.ring); i++ {
-		idx := (startIdx + i) % len(p.ring)
-		nid := p.ring[idx].NodeID
-		if !seen[nid] {
-			seen[nid] = true
+	// Collect unique node IDs clockwise from startIdx
+	candidates := make([]string, 0, rf*2)
+	seen := make(map[string]struct{}, rf*2)
+	for i := 0; i < len(ring); i++ {
+		nid := ring[(startIdx+i)%len(ring)].NodeID
+		if _, ok := seen[nid]; !ok {
+			seen[nid] = struct{}{}
 			candidates = append(candidates, nid)
 		}
 	}
 
-	if p.rackMap == nil || len(p.rackMap) == 0 {
-		// No rack awareness: take first RF unique nodes in ring order
-		rf := p.ReplicationFactor
+	if len(rackMap) == 0 {
 		if rf > len(candidates) {
 			rf = len(candidates)
 		}
-		return append([]string{}, candidates[:rf]...)
+		out := make([]string, rf)
+		copy(out, candidates[:rf])
+		return out
 	}
 
-	// Rack-aware selection: spread replicas across racks for fault tolerance
-	replicas := make([]string, 0, p.ReplicationFactor)
-	racksUsed := make(map[string]bool)
-	// Step 1: add primary (first node in ring order)
+	replicas := make([]string, 0, rf)
+	racksUsed := make(map[string]struct{}, rf)
 	replicas = append(replicas, candidates[0])
-	racksUsed[p.rackMap[candidates[0]]] = true
+	racksUsed[rackMap[candidates[0]]] = struct{}{}
 
-	// Step 2: add nodes from racks we don't have yet (maximize rack diversity)
 	for _, nid := range candidates[1:] {
-		if len(replicas) >= p.ReplicationFactor {
+		if len(replicas) >= rf {
 			break
 		}
-		rack := p.rackMap[nid]
-		if !racksUsed[rack] {
-			racksUsed[rack] = true
+		rack := rackMap[nid]
+		if _, used := racksUsed[rack]; !used {
+			racksUsed[rack] = struct{}{}
 			replicas = append(replicas, nid)
 		}
 	}
-	// Step 3: fill remaining slots with any nodes (same rack ok when RF > num racks)
 	for _, nid := range candidates[1:] {
-		if len(replicas) >= p.ReplicationFactor {
+		if len(replicas) >= rf {
 			break
 		}
 		have := false
@@ -185,10 +196,28 @@ func (p *Partitioner) GetReplicas(key []byte) []string {
 	return replicas
 }
 
-// GetRing returns ring topology
+// GetReplicas returns replica nodes for a key, clockwise from the key's token
+// on the ring with rack-aware selection. The returned slice is shared with
+// other callers and the cached snapshot — callers MUST NOT mutate it.
+func (p *Partitioner) GetReplicas(key []byte) []string {
+	s := p.snap.Load()
+	if s == nil || len(s.ring) == 0 {
+		return nil
+	}
+	token := TokenForKey(key)
+	idx := sort.Search(len(s.ring), func(i int) bool { return s.ring[i].Token >= token })
+	if idx == len(s.ring) {
+		idx = 0 // wrap clockwise past the highest token
+	}
+	return s.replicas[idx]
+}
+
+// GetRing returns a copy of the ring topology (safe to inspect/mutate).
 func (p *Partitioner) GetRing() []RingEntry {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return append([]RingEntry{}, p.ring...)
+	s := p.snap.Load()
+	if s == nil {
+		return nil
+	}
+	return append([]RingEntry{}, s.ring...)
 }
 

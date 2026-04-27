@@ -49,8 +49,23 @@ func appendBulkStringStr(buf []byte, s string) []byte {
 	return append(buf, crlf...)
 }
 
-// EncodeSimpleString returns +OK\r\n
+// Cached responses for the two strings the hot paths return on every ack.
+// Returning the shared backing array avoids a 5-byte alloc per call and
+// shows up as a measurable win at the coordinator layer (PING/SET on RF=1).
+// Callers MUST NOT mutate the returned slice.
+var (
+	respOK   = []byte("+OK\r\n")
+	respPong = []byte("+PONG\r\n")
+)
+
+// EncodeSimpleString returns +s\r\n. Allocation-free for "OK" and "PONG".
 func EncodeSimpleString(s string) []byte {
+	switch s {
+	case "OK":
+		return respOK
+	case "PONG":
+		return respPong
+	}
 	return []byte("+" + s + "\r\n")
 }
 

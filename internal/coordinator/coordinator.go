@@ -131,7 +131,7 @@ type replica struct {
 
 func (c *Coordinator) getReplicas(key []byte) []replica {
 	nids := c.Partitioner.GetReplicas(key)
-	var out []replica
+	out := make([]replica, 0, len(nids))
 	for _, nid := range nids {
 		host, port, ok := c.Gossip.GetNodeByID(nid)
 		if ok {
@@ -173,6 +173,15 @@ func (c *Coordinator) parallelDispatch(replicas []replica, required int, fn func
 	}
 	if required < 1 {
 		required = 1
+	}
+	// Single-replica fast path: skip the goroutine + channel + wakep cost
+	// (~300 ns of pure overhead per command for RF=1 clusters).
+	if len(replicas) == 1 {
+		body, ok := fn(replicas[0])
+		if ok {
+			return body, 1
+		}
+		return nil, 0
 	}
 	type result struct {
 		body []byte
@@ -506,9 +515,25 @@ func (c *Coordinator) Execute(cmdName []byte, args [][]byte, consistencyOverride
 		}
 		required := c.requiredReplicasFor(consistencyOverride)
 		total := 0
+		delOnReplica := func(r replica, key []byte) (ok bool, had bool) {
+			if r.nodeID == c.NodeID {
+				h, _ := c.Storage.SetTombstone(key)
+				return true, h
+			}
+			b, err := rpc.SendCommand(r.host, r.port, rpc.CmdSetTombstone, [][]byte{key})
+			return err == nil && b != nil, bytes.Equal(b, []byte("1"))
+		}
 		for _, key := range args {
 			replicas := c.getReplicas(key)
 			if len(replicas) == 0 {
+				continue
+			}
+			// Single-replica fast path: avoid goroutine + channel.
+			if len(replicas) == 1 {
+				ok, had := delOnReplica(replicas[0], key)
+				if ok && had && required <= 1 {
+					total++
+				}
 				continue
 			}
 			type res struct {
@@ -519,13 +544,8 @@ func (c *Coordinator) Execute(cmdName []byte, args [][]byte, consistencyOverride
 			for _, r := range replicas {
 				r := r
 				go func() {
-					if r.nodeID == c.NodeID {
-						had, _ := c.Storage.SetTombstone(key)
-						out <- res{true, had}
-						return
-					}
-					b, err := rpc.SendCommand(r.host, r.port, rpc.CmdSetTombstone, [][]byte{key})
-					out <- res{err == nil && b != nil, bytes.Equal(b, []byte("1"))}
+					ok, had := delOnReplica(r, key)
+					out <- res{ok, had}
 				}()
 			}
 			acks := 0
