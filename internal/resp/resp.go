@@ -211,32 +211,121 @@ func NewResponseReader(conn io.Reader) *ResponseReader {
 }
 
 // ReadResponse reads one complete RESP response and returns it as raw bytes.
+// Streams element-by-element so each byte is scanned at most once even for
+// arrays with millions of elements (e.g. KEYS *) — earlier versions re-parsed
+// the entire pending buffer on every chunk read, which made large replies
+// burn CPU as O(N²).
 func (r *ResponseReader) ReadResponse() ([]byte, error) {
-	for {
-		resp, consumed, err := r.tryParseOne(r.buf)
-		if err == errNeedMore {
-			chunk := make([]byte, 4096)
-			n, readErr := r.conn.Read(chunk)
-			if n > 0 {
-				r.buf = append(r.buf, chunk[:n]...)
-			}
-			if readErr != nil {
-				if len(r.buf) > 0 {
-					return nil, readErr
-				}
-				return nil, readErr
-			}
-			continue
-		}
+	var out []byte
+	if err := r.readOneInto(&out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// readOneInto appends one complete RESP value (recursively, for arrays) to *out.
+func (r *ResponseReader) readOneInto(out *[]byte) error {
+	line, err := r.readLine()
+	if err != nil {
+		return err
+	}
+	if len(line) < 3 {
+		return fmt.Errorf("invalid RESP line")
+	}
+	*out = append(*out, line...)
+	switch line[0] {
+	case '+', '-', ':':
+		return nil
+	case '$':
+		length, err := strconv.Atoi(string(line[1 : len(line)-2]))
 		if err != nil {
-			return nil, err
+			return err
 		}
-		r.buf = r.buf[consumed:]
-		return resp, nil
+		if length < 0 {
+			return nil // nil bulk
+		}
+		if length > maxBulkLen {
+			return fmt.Errorf("bulk length %d exceeds max %d", length, maxBulkLen)
+		}
+		body, err := r.readN(length + len(crlf))
+		if err != nil {
+			return err
+		}
+		*out = append(*out, body...)
+		return nil
+	case '*':
+		count, err := strconv.Atoi(string(line[1 : len(line)-2]))
+		if err != nil {
+			return err
+		}
+		if count < 0 {
+			return nil // nil array
+		}
+		if count > maxArrayLen {
+			return fmt.Errorf("array length %d exceeds max %d", count, maxArrayLen)
+		}
+		for i := 0; i < count; i++ {
+			if err := r.readOneInto(out); err != nil {
+				return err
+			}
+		}
+		return nil
+	default:
+		return fmt.Errorf("invalid RESP type: %c", line[0])
 	}
 }
 
-var errNeedMore = fmt.Errorf("need more data")
+// readLine reads bytes from r.buf/conn until it finds the next CRLF and
+// returns the line including the trailing CRLF.
+func (r *ResponseReader) readLine() ([]byte, error) {
+	searchFrom := 0
+	for {
+		if idx := bytes.Index(r.buf[searchFrom:], crlf); idx >= 0 {
+			end := searchFrom + idx + len(crlf)
+			line := make([]byte, end)
+			copy(line, r.buf[:end])
+			r.buf = r.buf[end:]
+			return line, nil
+		}
+		// Resume the next search at the tail so we don't re-scan bytes we've
+		// already proven CRLF-free.
+		if len(r.buf) >= len(crlf) {
+			searchFrom = len(r.buf) - (len(crlf) - 1)
+		}
+		if err := r.fillOnce(); err != nil {
+			return nil, err
+		}
+	}
+}
+
+// readN reads exactly n bytes from r.buf/conn.
+func (r *ResponseReader) readN(n int) ([]byte, error) {
+	for len(r.buf) < n {
+		if err := r.fillOnce(); err != nil {
+			return nil, err
+		}
+	}
+	out := make([]byte, n)
+	copy(out, r.buf[:n])
+	r.buf = r.buf[n:]
+	return out, nil
+}
+
+// fillOnce reads one chunk from the underlying conn into r.buf.
+func (r *ResponseReader) fillOnce() error {
+	chunk := make([]byte, 32*1024)
+	n, err := r.conn.Read(chunk)
+	if n > 0 {
+		r.buf = append(r.buf, chunk[:n]...)
+	}
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return io.ErrNoProgress
+	}
+	return nil
+}
 
 // FormatResponse converts raw RESP bytes to a human-readable string for display.
 func FormatResponse(raw []byte) string {
@@ -360,57 +449,3 @@ func parseOneValue(data []byte) ([]byte, int) {
 	return nil, 0
 }
 
-// tryParseOne parses one complete RESP value recursively (handles nested arrays).
-func (r *ResponseReader) tryParseOne(data []byte) (response []byte, consumed int, err error) {
-	if len(data) < 3 {
-		return nil, 0, errNeedMore
-	}
-	switch data[0] {
-	case '+', '-', ':':
-		idx := bytes.Index(data, crlf)
-		if idx == -1 {
-			return nil, 0, errNeedMore
-		}
-		return data[:idx+len(crlf)], idx + len(crlf), nil
-	case '$':
-		idx := bytes.Index(data, crlf)
-		if idx == -1 {
-			return nil, 0, errNeedMore
-		}
-		length, err := strconv.Atoi(string(data[1:idx]))
-		if err != nil {
-			return nil, 0, err
-		}
-		consumed = idx + len(crlf)
-		if length == -1 {
-			return data[:consumed], consumed, nil
-		}
-		need := consumed + length + len(crlf)
-		if len(data) < need {
-			return nil, 0, errNeedMore
-		}
-		return data[:need], need, nil
-	case '*':
-		idx := bytes.Index(data, crlf)
-		if idx == -1 {
-			return nil, 0, errNeedMore
-		}
-		count, err := strconv.Atoi(string(data[1:idx]))
-		if err != nil {
-			return nil, 0, err
-		}
-		consumed = idx + len(crlf)
-		remaining := data[consumed:]
-		for i := 0; i < count; i++ {
-			_, c, err := r.tryParseOne(remaining)
-			if err != nil {
-				return nil, 0, err
-			}
-			consumed += c
-			remaining = remaining[c:]
-		}
-		return data[:consumed], consumed, nil
-	default:
-		return nil, 0, fmt.Errorf("invalid RESP type: %c", data[0])
-	}
-}
