@@ -16,7 +16,16 @@ import (
 func main() {
 	seeds := flag.String("h", "127.0.0.1:6379", "Seed address(es), comma-separated for multiple (e.g. 127.0.0.1:6379,127.0.0.1:6380)")
 	consistency := flag.String("c", "", "Consistency level: ONE, QUORUM, or ALL (default: server QUORUM)")
+	user := flag.String("user", "", "Username for AUTH (default user when empty); overrides CARP_USER")
+	password := flag.String("a", "", "Password for AUTH; overrides CARP_PASSWORD. Prefer the env var to keep the password out of process listings")
 	flag.Parse()
+
+	if *user == "" {
+		*user = os.Getenv("CARP_USER")
+	}
+	if *password == "" {
+		*password = os.Getenv("CARP_PASSWORD")
+	}
 
 	seedList := strings.Split(*seeds, ",")
 	for i, s := range seedList {
@@ -27,6 +36,9 @@ func main() {
 	}
 
 	c := client.New(seedList)
+	if *password != "" || *user != "" {
+		c.SetCredentials(*user, *password)
+	}
 	if *consistency != "" {
 		cl := parseConsistency(*consistency)
 		if cl != client.ConsistencyLevelDefault {

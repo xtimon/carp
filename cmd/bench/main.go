@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"math/rand"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -23,10 +24,20 @@ func main() {
 	consistency := flag.String("C", "", "Consistency level: ONE, QUORUM, or ALL")
 	quiet := flag.Bool("q", false, "Quiet mode - only show summary")
 	duration := flag.Duration("D", 0, "Run for specified duration (overrides -n)")
+	user := flag.String("user", "", "Username for AUTH (default user when empty); overrides CARP_USER")
+	password := flag.String("a", "", "Password for AUTH; overrides CARP_PASSWORD. Prefer the env var to keep the password out of process listings")
 	flag.Parse()
+
+	if *user == "" {
+		*user = os.Getenv("CARP_USER")
+	}
+	if *password == "" {
+		*password = os.Getenv("CARP_PASSWORD")
+	}
 
 	seedList := parseSeeds(*seeds)
 	cl := parseConsistency(*consistency)
+	auth := authOpts{user: *user, password: *password}
 	testList := strings.Split(strings.ToLower(*tests), ",")
 	for i, t := range testList {
 		testList[i] = strings.TrimSpace(t)
@@ -51,69 +62,69 @@ func main() {
 	for _, t := range testList {
 		switch t {
 		case "ping":
-			runTest("PING", *clients, *requests, totalDuration, *quiet, seedList, cl, func(c *client.Client, _ int) error {
+			runTest("PING", *clients, *requests, totalDuration, *quiet, seedList, cl, auth, func(c *client.Client, _ int) error {
 				_, err := c.Do("PING")
 				return err
 			})
 		case "set":
-			runTest("SET", *clients, *requests, totalDuration, *quiet, seedList, cl, func(c *client.Client, i int) error {
+			runTest("SET", *clients, *requests, totalDuration, *quiet, seedList, cl, auth, func(c *client.Client, i int) error {
 				key := []byte(fmt.Sprintf("bench:key:%d", rand.Intn(*keyspace)))
 				_, err := c.Do("SET", key, value)
 				return err
 			})
 		case "get":
-			runTest("GET", *clients, *requests, totalDuration, *quiet, seedList, cl, func(c *client.Client, i int) error {
+			runTest("GET", *clients, *requests, totalDuration, *quiet, seedList, cl, auth, func(c *client.Client, i int) error {
 				key := []byte(fmt.Sprintf("bench:key:%d", rand.Intn(*keyspace)))
 				_, err := c.Do("GET", key)
 				return err
 			})
 		case "incr":
-			runTest("INCR", *clients, *requests, totalDuration, *quiet, seedList, cl, func(c *client.Client, i int) error {
+			runTest("INCR", *clients, *requests, totalDuration, *quiet, seedList, cl, auth, func(c *client.Client, i int) error {
 				key := []byte(fmt.Sprintf("bench:incr:%d", rand.Intn(*keyspace)))
 				_, err := c.Do("INCR", key)
 				return err
 			})
 		case "lpush":
-			runTest("LPUSH", *clients, *requests, totalDuration, *quiet, seedList, cl, func(c *client.Client, i int) error {
+			runTest("LPUSH", *clients, *requests, totalDuration, *quiet, seedList, cl, auth, func(c *client.Client, i int) error {
 				key := []byte(fmt.Sprintf("bench:list:%d", rand.Intn(*keyspace)))
 				_, err := c.Do("LPUSH", key, value)
 				return err
 			})
 		case "lpop":
-			runTest("LPOP", *clients, *requests, totalDuration, *quiet, seedList, cl, func(c *client.Client, i int) error {
+			runTest("LPOP", *clients, *requests, totalDuration, *quiet, seedList, cl, auth, func(c *client.Client, i int) error {
 				key := []byte(fmt.Sprintf("bench:list:%d", rand.Intn(*keyspace)))
 				_, err := c.Do("LPOP", key)
 				return err
 			})
 		case "sadd":
-			runTest("SADD", *clients, *requests, totalDuration, *quiet, seedList, cl, func(c *client.Client, i int) error {
+			runTest("SADD", *clients, *requests, totalDuration, *quiet, seedList, cl, auth, func(c *client.Client, i int) error {
 				key := []byte(fmt.Sprintf("bench:set:%d", rand.Intn(*keyspace)))
 				member := []byte(fmt.Sprintf("member:%d", i))
 				_, err := c.Do("SADD", key, member)
 				return err
 			})
 		case "spop":
-			runTest("SPOP", *clients, *requests, totalDuration, *quiet, seedList, cl, func(c *client.Client, i int) error {
+			runTest("SPOP", *clients, *requests, totalDuration, *quiet, seedList, cl, auth, func(c *client.Client, i int) error {
 				key := []byte(fmt.Sprintf("bench:set:%d", rand.Intn(*keyspace)))
 				_, err := c.Do("SPOP", key)
 				return err
 			})
 		case "hset":
-			runTest("HSET", *clients, *requests, totalDuration, *quiet, seedList, cl, func(c *client.Client, i int) error {
+			runTest("HSET", *clients, *requests, totalDuration, *quiet, seedList, cl, auth, func(c *client.Client, i int) error {
 				key := []byte(fmt.Sprintf("bench:hash:%d", rand.Intn(*keyspace)))
 				field := []byte(fmt.Sprintf("f%d", i%100))
 				_, err := c.Do("HSET", key, field, value)
 				return err
 			})
 		case "hget":
-			runTest("HGET", *clients, *requests, totalDuration, *quiet, seedList, cl, func(c *client.Client, i int) error {
+			runTest("HGET", *clients, *requests, totalDuration, *quiet, seedList, cl, auth, func(c *client.Client, i int) error {
 				key := []byte(fmt.Sprintf("bench:hash:%d", rand.Intn(*keyspace)))
 				field := []byte(fmt.Sprintf("f%d", i%100))
 				_, err := c.Do("HGET", key, field)
 				return err
 			})
 		case "zadd":
-			runTest("ZADD", *clients, *requests, totalDuration, *quiet, seedList, cl, func(c *client.Client, i int) error {
+			runTest("ZADD", *clients, *requests, totalDuration, *quiet, seedList, cl, auth, func(c *client.Client, i int) error {
 				key := []byte(fmt.Sprintf("bench:zset:%d", rand.Intn(*keyspace)))
 				member := []byte(fmt.Sprintf("m%d", i))
 				score := []byte(fmt.Sprintf("%d", i))
@@ -121,7 +132,7 @@ func main() {
 				return err
 			})
 		case "zrange":
-			runTest("ZRANGE", *clients, *requests, totalDuration, *quiet, seedList, cl, func(c *client.Client, i int) error {
+			runTest("ZRANGE", *clients, *requests, totalDuration, *quiet, seedList, cl, auth, func(c *client.Client, i int) error {
 				key := []byte(fmt.Sprintf("bench:zset:%d", rand.Intn(*keyspace)))
 				_, err := c.Do("ZRANGE", key, []byte("0"), []byte("9"))
 				return err
@@ -163,7 +174,12 @@ func parseConsistency(s string) client.ConsistencyLevel {
 
 type benchFn func(*client.Client, int) error
 
-func runTest(name string, numClients, numRequests int, maxDuration time.Duration, quiet bool, seeds []string, consistency client.ConsistencyLevel, fn benchFn) {
+type authOpts struct {
+	user     string
+	password string
+}
+
+func runTest(name string, numClients, numRequests int, maxDuration time.Duration, quiet bool, seeds []string, consistency client.ConsistencyLevel, auth authOpts, fn benchFn) {
 	reqPerClient := (numRequests + numClients - 1) / numClients
 
 	var completed atomic.Int64
@@ -179,6 +195,9 @@ func runTest(name string, numClients, numRequests int, maxDuration time.Duration
 		go func() {
 			defer wg.Done()
 			c := client.New(seeds)
+			if auth.user != "" || auth.password != "" {
+				c.SetCredentials(auth.user, auth.password)
+			}
 			if consistency != client.ConsistencyLevelDefault {
 				c.SetConsistencyLevel(consistency)
 			}
