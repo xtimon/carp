@@ -10,15 +10,16 @@ type hashEntry struct {
 
 // HSet sets field=value, returns 1 if new field else 0 (clears tombstone)
 func (s *Storage) HSet(key, field, value []byte) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.maybeExpireHash(key)
+	sh := s.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 	k := string(key)
-	delete(s.tombs, k)
-	he := s.hashes[k]
+	sh.maybeExpireHash(k)
+	delete(sh.tombs, k)
+	he := sh.hashes[k]
 	if he == nil {
 		he = &hashEntry{fields: make(map[string][]byte)}
-		s.hashes[k] = he
+		sh.hashes[k] = he
 	}
 	fs := string(field)
 	_, existed := he.fields[fs]
@@ -31,9 +32,10 @@ func (s *Storage) HSet(key, field, value []byte) (int, error) {
 
 // HGet returns field value or nil (read-only).
 func (s *Storage) HGet(key, field []byte) ([]byte, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	he := s.hashes[string(key)]
+	sh := s.shardFor(key)
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
+	he := sh.hashes[string(key)]
 	if he == nil || expired(he.expire) {
 		return nil, nil
 	}
@@ -42,11 +44,12 @@ func (s *Storage) HGet(key, field []byte) ([]byte, error) {
 
 // HDel removes fields, returns count removed
 func (s *Storage) HDel(key []byte, fields ...[]byte) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.maybeExpireHash(key)
+	sh := s.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 	k := string(key)
-	he := s.hashes[k]
+	sh.maybeExpireHash(k)
+	he := sh.hashes[k]
 	if he == nil {
 		return 0, nil
 	}
@@ -59,16 +62,17 @@ func (s *Storage) HDel(key []byte, fields ...[]byte) (int, error) {
 		}
 	}
 	if len(he.fields) == 0 {
-		delete(s.hashes, k)
+		delete(sh.hashes, k)
 	}
 	return removed, nil
 }
 
 // HExists returns 1 if field exists, 0 otherwise (read-only).
 func (s *Storage) HExists(key, field []byte) (int, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	he := s.hashes[string(key)]
+	sh := s.shardFor(key)
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
+	he := sh.hashes[string(key)]
 	if he == nil || expired(he.expire) {
 		return 0, nil
 	}
@@ -80,9 +84,10 @@ func (s *Storage) HExists(key, field []byte) (int, error) {
 
 // HLen returns number of fields (read-only).
 func (s *Storage) HLen(key []byte) (int, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	he := s.hashes[string(key)]
+	sh := s.shardFor(key)
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
+	he := sh.hashes[string(key)]
 	if he == nil || expired(he.expire) {
 		return 0, nil
 	}
@@ -91,9 +96,10 @@ func (s *Storage) HLen(key []byte) (int, error) {
 
 // HGetAll returns all field-value pairs [f1,v1,f2,v2,...] (read-only).
 func (s *Storage) HGetAll(key []byte) ([][]byte, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	he := s.hashes[string(key)]
+	sh := s.shardFor(key)
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
+	he := sh.hashes[string(key)]
 	if he == nil || expired(he.expire) {
 		return [][]byte{}, nil
 	}
@@ -106,9 +112,10 @@ func (s *Storage) HGetAll(key []byte) ([][]byte, error) {
 
 // HKeys returns all field names (read-only).
 func (s *Storage) HKeys(key []byte) ([][]byte, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	he := s.hashes[string(key)]
+	sh := s.shardFor(key)
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
+	he := sh.hashes[string(key)]
 	if he == nil || expired(he.expire) {
 		return [][]byte{}, nil
 	}
@@ -121,9 +128,10 @@ func (s *Storage) HKeys(key []byte) ([][]byte, error) {
 
 // HVals returns all values (read-only).
 func (s *Storage) HVals(key []byte) ([][]byte, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	he := s.hashes[string(key)]
+	sh := s.shardFor(key)
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
+	he := sh.hashes[string(key)]
 	if he == nil || expired(he.expire) {
 		return [][]byte{}, nil
 	}
@@ -134,13 +142,12 @@ func (s *Storage) HVals(key []byte) ([][]byte, error) {
 	return out, nil
 }
 
-func (s *Storage) maybeExpireHash(key []byte) {
-	k := string(key)
-	he := s.hashes[k]
+func (sh *shard) maybeExpireHash(k string) {
+	he := sh.hashes[k]
 	if he == nil || he.expire == nil {
 		return
 	}
 	if time.Now().After(*he.expire) {
-		delete(s.hashes, k)
+		delete(sh.hashes, k)
 	}
 }

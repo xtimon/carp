@@ -39,15 +39,16 @@ func (z *zsetEntry) ensureOrder() {
 // Returns count of new members added (clears tombstone).
 // Uses lazy order rebuild: marks dirty on write, rebuilds on first read.
 func (s *Storage) ZAdd(key []byte, args [][]byte) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.maybeExpireZSet(key)
+	sh := s.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 	k := string(key)
-	delete(s.tombs, k)
-	ze := s.zsets[k]
+	sh.maybeExpireZSet(k)
+	delete(sh.tombs, k)
+	ze := sh.zsets[k]
 	if ze == nil {
 		ze = &zsetEntry{scores: make(map[string]float64)}
-		s.zsets[k] = ze
+		sh.zsets[k] = ze
 	}
 	added := 0
 	for i := 0; i+1 < len(args); i += 2 {
@@ -64,11 +65,12 @@ func (s *Storage) ZAdd(key []byte, args [][]byte) (int, error) {
 
 // ZRem removes members, returns count removed
 func (s *Storage) ZRem(key []byte, members ...[]byte) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.maybeExpireZSet(key)
+	sh := s.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 	k := string(key)
-	ze := s.zsets[k]
+	sh.maybeExpireZSet(k)
+	ze := sh.zsets[k]
 	if ze == nil {
 		return 0, nil
 	}
@@ -81,7 +83,7 @@ func (s *Storage) ZRem(key []byte, members ...[]byte) (int, error) {
 		}
 	}
 	if len(ze.scores) == 0 {
-		delete(s.zsets, k)
+		delete(sh.zsets, k)
 	} else {
 		ze.order = nil
 	}
@@ -90,9 +92,10 @@ func (s *Storage) ZRem(key []byte, members ...[]byte) (int, error) {
 
 // ZScore returns member's score (read-only).
 func (s *Storage) ZScore(key, member []byte) (float64, bool, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	ze := s.zsets[string(key)]
+	sh := s.shardFor(key)
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
+	ze := sh.zsets[string(key)]
 	if ze == nil || expired(ze.expire) {
 		return 0, false, nil
 	}
@@ -102,9 +105,10 @@ func (s *Storage) ZScore(key, member []byte) (float64, bool, error) {
 
 // ZCard returns sorted set size (read-only).
 func (s *Storage) ZCard(key []byte) (int, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	ze := s.zsets[string(key)]
+	sh := s.shardFor(key)
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
+	ze := sh.zsets[string(key)]
 	if ze == nil || expired(ze.expire) {
 		return 0, nil
 	}
@@ -113,10 +117,12 @@ func (s *Storage) ZCard(key []byte) (int, error) {
 
 // ZRank returns 0-based rank (lowest score = 0)
 func (s *Storage) ZRank(key, member []byte) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.maybeExpireZSet(key)
-	ze := s.zsets[string(key)]
+	sh := s.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	k := string(key)
+	sh.maybeExpireZSet(k)
+	ze := sh.zsets[k]
 	if ze == nil {
 		return -1, nil
 	}
@@ -135,10 +141,12 @@ func (s *Storage) ZRank(key, member []byte) (int, error) {
 
 // ZRevRank returns rank from high to low
 func (s *Storage) ZRevRank(key, member []byte) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.maybeExpireZSet(key)
-	ze := s.zsets[string(key)]
+	sh := s.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	k := string(key)
+	sh.maybeExpireZSet(k)
+	ze := sh.zsets[k]
 	if ze == nil {
 		return -1, nil
 	}
@@ -158,10 +166,12 @@ func (s *Storage) ZRevRank(key, member []byte) (int, error) {
 
 // ZRange returns members from start to stop (inclusive)
 func (s *Storage) ZRange(key []byte, start, stop int, withScores bool) ([][]byte, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.maybeExpireZSet(key)
-	ze := s.zsets[string(key)]
+	sh := s.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	k := string(key)
+	sh.maybeExpireZSet(k)
+	ze := sh.zsets[k]
 	if ze == nil {
 		return [][]byte{}, nil
 	}
@@ -193,13 +203,12 @@ func (s *Storage) ZRange(key []byte, start, stop int, withScores bool) ([][]byte
 	return out, nil
 }
 
-func (s *Storage) maybeExpireZSet(key []byte) {
-	k := string(key)
-	ze := s.zsets[k]
+func (sh *shard) maybeExpireZSet(k string) {
+	ze := sh.zsets[k]
 	if ze == nil || ze.expire == nil {
 		return
 	}
 	if time.Now().After(*ze.expire) {
-		delete(s.zsets, k)
+		delete(sh.zsets, k)
 	}
 }

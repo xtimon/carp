@@ -21,19 +21,20 @@ const (
 // Binary format: [1 byte type][4 byte ttl sec, -1=no TTL][type-specific payload]
 // Types: string=raw bytes; list/set=[4 byte count][4 byte len, item bytes]*; hash=[4 byte len, field, 4 byte len, value]*; zset=[8 byte score, 4 byte len, member]*.
 func (s *Storage) DumpKey(key []byte) ([]byte, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	sh := s.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 	k := string(key)
 
 	// Expire any stale keys first
-	s.maybeExpire(key)
-	s.maybeExpireList(key)
-	s.maybeExpireSet(key)
-	s.maybeExpireHash(key)
-	s.maybeExpireZSet(key)
+	sh.maybeExpire(k)
+	sh.maybeExpireList(k)
+	sh.maybeExpireSet(k)
+	sh.maybeExpireHash(k)
+	sh.maybeExpireZSet(k)
 
 	var ttlSec int32 = -1
-	if e, ok := s.data[k]; ok {
+	if e, ok := sh.data[k]; ok {
 		if e.expire != nil {
 			ttlSec = int32(time.Until(*e.expire).Seconds())
 			if ttlSec < 0 {
@@ -46,46 +47,46 @@ func (s *Storage) DumpKey(key []byte) ([]byte, error) {
 		copy(buf[5:], e.value)
 		return buf, nil
 	}
-	if le, ok := s.lists[k]; ok {
+	if le, ok := sh.lists[k]; ok {
 		if le.expire != nil {
 			ttlSec = int32(time.Until(*le.expire).Seconds())
 			if ttlSec < 0 {
 				ttlSec = 0
 			}
 		}
-		return s.dumpList(le, ttlSec)
+		return dumpList(le, ttlSec)
 	}
-	if se, ok := s.sets[k]; ok {
+	if se, ok := sh.sets[k]; ok {
 		if se.expire != nil {
 			ttlSec = int32(time.Until(*se.expire).Seconds())
 			if ttlSec < 0 {
 				ttlSec = 0
 			}
 		}
-		return s.dumpSet(se, ttlSec)
+		return dumpSet(se, ttlSec)
 	}
-	if he, ok := s.hashes[k]; ok {
+	if he, ok := sh.hashes[k]; ok {
 		if he.expire != nil {
 			ttlSec = int32(time.Until(*he.expire).Seconds())
 			if ttlSec < 0 {
 				ttlSec = 0
 			}
 		}
-		return s.dumpHash(he, ttlSec)
+		return dumpHash(he, ttlSec)
 	}
-	if ze, ok := s.zsets[k]; ok {
+	if ze, ok := sh.zsets[k]; ok {
 		if ze.expire != nil {
 			ttlSec = int32(time.Until(*ze.expire).Seconds())
 			if ttlSec < 0 {
 				ttlSec = 0
 			}
 		}
-		return s.dumpZSet(ze, ttlSec)
+		return dumpZSet(ze, ttlSec)
 	}
 	return nil, nil
 }
 
-func (s *Storage) dumpList(le *listEntry, ttl int32) ([]byte, error) {
+func dumpList(le *listEntry, ttl int32) ([]byte, error) {
 	items := le.listItems()
 	size := 1 + 4 + 4
 	for _, it := range items {
@@ -105,7 +106,7 @@ func (s *Storage) dumpList(le *listEntry, ttl int32) ([]byte, error) {
 	return buf, nil
 }
 
-func (s *Storage) dumpSet(se *setEntry, ttl int32) ([]byte, error) {
+func dumpSet(se *setEntry, ttl int32) ([]byte, error) {
 	members := make([][]byte, 0, len(se.members))
 	for m := range se.members {
 		members = append(members, []byte(m))
@@ -128,7 +129,7 @@ func (s *Storage) dumpSet(se *setEntry, ttl int32) ([]byte, error) {
 	return buf, nil
 }
 
-func (s *Storage) dumpHash(he *hashEntry, ttl int32) ([]byte, error) {
+func dumpHash(he *hashEntry, ttl int32) ([]byte, error) {
 	size := 1 + 4 + 4
 	for f, v := range he.fields {
 		size += 4 + len(f) + 4 + len(v)
@@ -151,7 +152,7 @@ func (s *Storage) dumpHash(he *hashEntry, ttl int32) ([]byte, error) {
 	return buf, nil
 }
 
-func (s *Storage) dumpZSet(ze *zsetEntry, ttl int32) ([]byte, error) {
+func dumpZSet(ze *zsetEntry, ttl int32) ([]byte, error) {
 	ze.ensureOrder()
 	size := 1 + 4 + 4
 	for _, m := range ze.order {
@@ -188,28 +189,29 @@ func (s *Storage) RestoreKey(key, data []byte) error {
 	}
 	payload := data[5:]
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	sh := s.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 	k := string(key)
 
 	switch typ {
 	case migrateTypeString:
-		s.data[k] = entry{value: append([]byte(nil), payload...), expire: s.ttlFromSec(ttlPtr)}
+		sh.data[k] = entry{value: append([]byte(nil), payload...), expire: ttlFromSec(ttlPtr)}
 		return nil
 	case migrateTypeList:
-		return s.restoreList(k, payload, ttlPtr)
+		return restoreList(sh, k, payload, ttlPtr)
 	case migrateTypeSet:
-		return s.restoreSet(k, payload, ttlPtr)
+		return restoreSet(sh, k, payload, ttlPtr)
 	case migrateTypeHash:
-		return s.restoreHash(k, payload, ttlPtr)
+		return restoreHash(sh, k, payload, ttlPtr)
 	case migrateTypeZSet:
-		return s.restoreZSet(k, payload, ttlPtr)
+		return restoreZSet(sh, k, payload, ttlPtr)
 	default:
 		return errors.New("unknown key type in dump")
 	}
 }
 
-func (s *Storage) ttlFromSec(sec *int) *time.Time {
+func ttlFromSec(sec *int) *time.Time {
 	if sec == nil || *sec < 0 {
 		return nil
 	}
@@ -217,7 +219,7 @@ func (s *Storage) ttlFromSec(sec *int) *time.Time {
 	return &t
 }
 
-func (s *Storage) restoreList(k string, payload []byte, ttl *int) error {
+func restoreList(sh *shard, k string, payload []byte, ttl *int) error {
 	if len(payload) < 4 {
 		return errors.New("truncated list payload")
 	}
@@ -233,19 +235,19 @@ func (s *Storage) restoreList(k string, payload []byte, ttl *int) error {
 		items = append(items, append([]byte(nil), payload[off:off+int(alen)]...))
 		off += int(alen)
 	}
-	le := &listEntry{expire: s.ttlFromSec(ttl)}
+	le := &listEntry{expire: ttlFromSec(ttl)}
 	le.setFromItems(items)
-	s.lists[k] = le
+	sh.lists[k] = le
 	return nil
 }
 
-func (s *Storage) restoreSet(k string, payload []byte, ttl *int) error {
+func restoreSet(sh *shard, k string, payload []byte, ttl *int) error {
 	if len(payload) < 4 {
 		return errors.New("truncated set payload")
 	}
 	n := int(binary.BigEndian.Uint32(payload[0:4]))
 	off := 4
-	se := &setEntry{members: make(map[string]bool), expire: s.ttlFromSec(ttl)}
+	se := &setEntry{members: make(map[string]bool), expire: ttlFromSec(ttl)}
 	for i := 0; i < n && off+4 <= len(payload); i++ {
 		alen := binary.BigEndian.Uint32(payload[off:])
 		off += 4
@@ -255,17 +257,17 @@ func (s *Storage) restoreSet(k string, payload []byte, ttl *int) error {
 		se.members[string(payload[off:off+int(alen)])] = true
 		off += int(alen)
 	}
-	s.sets[k] = se
+	sh.sets[k] = se
 	return nil
 }
 
-func (s *Storage) restoreHash(k string, payload []byte, ttl *int) error {
+func restoreHash(sh *shard, k string, payload []byte, ttl *int) error {
 	if len(payload) < 4 {
 		return errors.New("truncated hash payload")
 	}
 	n := int(binary.BigEndian.Uint32(payload[0:4]))
 	off := 4
-	he := &hashEntry{fields: make(map[string][]byte), expire: s.ttlFromSec(ttl)}
+	he := &hashEntry{fields: make(map[string][]byte), expire: ttlFromSec(ttl)}
 	for i := 0; i < n && off+8 <= len(payload); i++ {
 		flen := binary.BigEndian.Uint32(payload[off:])
 		off += 4
@@ -282,17 +284,17 @@ func (s *Storage) restoreHash(k string, payload []byte, ttl *int) error {
 		he.fields[field] = append([]byte(nil), payload[off:off+int(vlen)]...)
 		off += int(vlen)
 	}
-	s.hashes[k] = he
+	sh.hashes[k] = he
 	return nil
 }
 
-func (s *Storage) restoreZSet(k string, payload []byte, ttl *int) error {
+func restoreZSet(sh *shard, k string, payload []byte, ttl *int) error {
 	if len(payload) < 4 {
 		return errors.New("truncated zset payload")
 	}
 	n := int(binary.BigEndian.Uint32(payload[0:4]))
 	off := 4
-	ze := &zsetEntry{scores: make(map[string]float64), expire: s.ttlFromSec(ttl)}
+	ze := &zsetEntry{scores: make(map[string]float64), expire: ttlFromSec(ttl)}
 	for i := 0; i < n && off+12 <= len(payload); i++ {
 		score := math.Float64frombits(binary.BigEndian.Uint64(payload[off:]))
 		off += 8
@@ -314,6 +316,6 @@ func (s *Storage) restoreZSet(k string, payload []byte, ttl *int) error {
 		}
 		return ze.order[i] < ze.order[j]
 	})
-	s.zsets[k] = ze
+	sh.zsets[k] = ze
 	return nil
 }
