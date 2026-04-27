@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"io"
 	"net"
 	"strconv"
 	"sync"
@@ -13,6 +14,10 @@ import (
 )
 
 const rpcPoolSize = 8 // max pooled connections per addr to limit port usage
+
+// maxRPCMessageSize caps an RPC frame so a hostile/buggy peer can't push us
+// into a multi-GB allocation by lying about message length.
+const maxRPCMessageSize = 64 * 1024 * 1024
 
 var (
 	poolMu  sync.Mutex
@@ -105,7 +110,7 @@ func SendCommand(host string, redisPort int, cmd byte, args [][]byte) ([]byte, e
 		conn = nil
 		return nil, err
 	}
-	if _, err := conn.Read(lenBuf); err != nil {
+	if _, err := io.ReadFull(conn, lenBuf); err != nil {
 		conn.Close()
 		conn = nil
 		return nil, err
@@ -114,8 +119,13 @@ func SendCommand(host string, redisPort int, cmd byte, args [][]byte) ([]byte, e
 	if respLen == 0 {
 		return nil, nil
 	}
+	if respLen > maxRPCMessageSize {
+		conn.Close()
+		conn = nil
+		return nil, errors.New("rpc response too large")
+	}
 	resp := make([]byte, respLen)
-	if _, err := conn.Read(resp); err != nil {
+	if _, err := io.ReadFull(conn, resp); err != nil {
 		conn.Close()
 		conn = nil
 		return nil, err
@@ -150,11 +160,18 @@ func unpackCommand(data []byte) (byte, [][]byte, error) {
 	n := binary.BigEndian.Uint16(data[1:3])
 	var args [][]byte
 	off := 3
-	for i := 0; i < int(n) && off+4 <= len(data); i++ {
+	for i := 0; i < int(n); i++ {
+		if off+4 > len(data) {
+			return 0, nil, errors.New("truncated arg length")
+		}
 		alen := binary.BigEndian.Uint32(data[off:])
 		off += 4
-		args = append(args, data[off:off+int(alen)])
-		off += int(alen)
+		end := off + int(alen)
+		if end < off || end > len(data) {
+			return 0, nil, errors.New("truncated arg body")
+		}
+		args = append(args, data[off:end])
+		off = end
 	}
 	return cmd, args, nil
 }
@@ -171,12 +188,15 @@ func HandleConn(conn net.Conn, h *Handler) {
 	store := h.Store
 	defer conn.Close()
 	lenBuf := make([]byte, 4)
-	if _, err := conn.Read(lenBuf); err != nil {
+	if _, err := io.ReadFull(conn, lenBuf); err != nil {
 		return
 	}
 	msgLen := binary.BigEndian.Uint32(lenBuf)
+	if msgLen == 0 || msgLen > maxRPCMessageSize {
+		return
+	}
 	msg := make([]byte, msgLen)
-	if _, err := conn.Read(msg); err != nil {
+	if _, err := io.ReadFull(conn, msg); err != nil {
 		return
 	}
 	cmd, args, err := unpackCommand(msg)

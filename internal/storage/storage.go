@@ -145,6 +145,23 @@ func (s *Storage) RunTombstoneGC() int {
 	return n
 }
 
+// RunIdempotencyGC purges expired idempotency cache entries. Without this the
+// map grows for every (key, token) pair that's never read again — Get clears
+// expired entries lazily, but tokens used only once would otherwise leak.
+func (s *Storage) RunIdempotencyGC() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	n := 0
+	for k, e := range s.idempotency {
+		if now.After(e.expiresAt) {
+			delete(s.idempotency, k)
+			n++
+		}
+	}
+	return n
+}
+
 // Delete removes key immediately (no tombstone). Use for internal operations (e.g. rebalance).
 // For user DEL, use SetTombstone and replicate to all replicas.
 func (s *Storage) Delete(key []byte) (bool, error) {

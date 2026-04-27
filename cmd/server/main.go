@@ -310,6 +310,7 @@ func main() {
 				if n := store.RunTombstoneGC(); n > 0 {
 					log.Printf("[server] Tombstone GC purged %d entries", n)
 				}
+				store.RunIdempotencyGC()
 			}
 		}()
 		log.Printf("[server] Tombstone grace period %ds (GC every %v)", cfg.TombstoneGraceSeconds, interval)

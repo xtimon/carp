@@ -10,6 +10,13 @@ import (
 
 var crlf = []byte("\r\n")
 
+// Sanity caps for inbound RESP frames. A misbehaving client should not be
+// able to make us allocate or loop on absurd lengths/counts.
+const (
+	maxBulkLen   = 64 * 1024 * 1024 // 64 MiB per bulk string
+	maxArrayLen  = 1 << 20          // 1M elements per array
+)
+
 // EncodeCommand encodes a Redis command as a RESP array for sending over the wire.
 // Writes directly to a single buffer to avoid intermediate allocations.
 func EncodeCommand(cmd string, args ...[]byte) []byte {
@@ -136,6 +143,9 @@ func (r *Reader) parseArray() ([][]byte, int, error) {
 	if err != nil {
 		return nil, 0, err
 	}
+	if count < 0 || count > maxArrayLen {
+		return nil, 0, fmt.Errorf("invalid array length %d", count)
+	}
 	consumed := idx + len(crlf)
 	remaining := r.buf[consumed:]
 	var items [][]byte
@@ -150,7 +160,13 @@ func (r *Reader) parseArray() ([][]byte, int, error) {
 		if crlfPos == -1 {
 			return nil, 0, fmt.Errorf("need more data")
 		}
-		length, _ := strconv.Atoi(string(remaining[1:crlfPos]))
+		length, lerr := strconv.Atoi(string(remaining[1:crlfPos]))
+		if lerr != nil {
+			return nil, 0, lerr
+		}
+		if length < -1 || length > maxBulkLen {
+			return nil, 0, fmt.Errorf("invalid bulk length %d", length)
+		}
 		consumed += crlfPos + len(crlf)
 		if length == -1 {
 			// Null bulk string: $-1\r\n → treat as empty item
